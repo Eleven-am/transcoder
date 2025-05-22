@@ -224,6 +224,16 @@ export class HLSController {
     }
 
     /**
+     * Create metadata for a media source
+     * @param filePath The file path of the media source
+     */
+    createMetadata (filePath: string): Promise<void> {
+        const source = this.#buildMediaSource(filePath);
+
+        return this.#metadataService.createMetadata(source).toPromise();
+    }
+
+    /**
      * Set up client tracker event listeners
      * @private
      */

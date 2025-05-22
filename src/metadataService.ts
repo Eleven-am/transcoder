@@ -159,6 +159,15 @@ export class MetadataService {
     }
 
     /**
+     * Create metadata for a file
+     * @param source Media source to create metadata for
+     * @returns TaskEither containing the created metadata
+     */
+    createMetadata (source: MediaSource): TaskEither<void> {
+        return this.getMetadata(source).map(() => undefined);
+    }
+
+    /**
      * Extract keyframes from a file using ffprobe
      * @param source Media source to extract keyframes from
      * @param videoIndex Index of the video stream
