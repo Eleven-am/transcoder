@@ -1,0 +1,45 @@
+{
+  "name": "@eleven-am/transcoder",
+  "version": "0.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest --coverage --verbose",
+    "build": "rimraf dist && tsc",
+    "lint": "eslint --ext .ts src",
+    "lint:fix": "eslint --fix --ext .ts src",
+    "copy": "cp package.json dist && cp LICENSE dist && cp src/types.d.ts dist/types.d.ts && cp src/index.d.ts dist/index.d.ts",
+    "push": "npm version patch && npm run copy && cd dist && npm publish && cd ..",
+    "pipeline": "npm run build && npm run push"
+  },
+  "keywords": [],
+  "dependencies": {
+    "@eleven-am/fp": "^0.0.22",
+    "@eslint/js": "^9.27.0"
+  },
+  "devDependencies": {
+    "@stylistic/eslint-plugin-ts": "^4.2.0",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.15.21",
+    "@typescript-eslint/eslint-plugin": "^8.32.1",
+    "@typescript-eslint/parser": "^8.32.1",
+    "eslint": "^9.27.0",
+    "eslint-config-prettier": "^10.1.5",
+    "eslint-import-resolver-node": "^0.3.9",
+    "eslint-plugin-file-progress": "^3.0.2",
+    "eslint-plugin-import": "^2.31.0",
+    "eslint-plugin-prettier": "^5.4.0",
+    "globals": "^16.1.0",
+    "jest": "^29.7.0",
+    "prettier": "^3.5.3",
+    "source-map-support": "^0.5.21",
+    "supertest": "^7.1.1",
+    "ts-jest": "^29.3.4",
+    "ts-loader": "^9.5.2",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.8.3"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}

@@ -1,0 +1,8 @@
+# Project exclude paths
+/dist/
+/node_modules/
+/.idea
+
+# Project exclude paths
+/src/index.d.ts
+/src/types.d.ts
