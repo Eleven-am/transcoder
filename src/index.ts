@@ -1,3 +1,3 @@
 export { HLSController } from './hlsController';
-export { TranscodeType } from './types';
+export { TranscodeType, StreamType } from './types';
 
