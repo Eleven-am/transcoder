@@ -18,7 +18,7 @@ import {
     TranscodeType,
     VideoQualityEnum,
 } from './types';
-
+import { streamToString } from './utils';
 
 export class HLSController {
     #hwConfig: HardwareAccelerationConfig | null = null;
@@ -145,7 +145,22 @@ export class HLSController {
      * @param streamIndex The subtitle stream index to extract
      * @returns TaskEither containing the VTT content as string
      */
-    getVTTSubtitle (filePath: string, streamIndex: number): Promise<NodeJS.ReadableStream> {
+    getVTTSubtitle (filePath: string, streamIndex: number): Promise<string> {
+        const mediaSource = this.#buildMediaSource(filePath);
+
+        return TaskEither
+            .of(Stream.getVTTSubtitle(mediaSource, streamIndex))
+            .chain(streamToString)
+            .toPromise();
+    }
+
+    /**
+     * Extract subtitle from a media source and convert to WebVTT
+     * @param filePath The file path of the media source
+     * @param streamIndex The subtitle stream index to extract
+     * @returns TaskEither containing the VTT content as stream
+     */
+    getVTTSubtitleStream (filePath: string, streamIndex: number): Promise<NodeJS.ReadableStream> {
         const mediaSource = this.#buildMediaSource(filePath);
 
         return TaskEither

@@ -1,4 +1,4 @@
-import path from 'path';
+import * as path from 'path';
 
 import { createBadRequestError, createInternalError, Either, Result, sortBy, TaskEither } from '@eleven-am/fp';
 

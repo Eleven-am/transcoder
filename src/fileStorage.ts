@@ -1,6 +1,7 @@
 import crypto from 'crypto';
-import fs, { promises as pfs } from 'fs';
-import path from 'path';
+import * as fs from 'fs';
+import * as pfs from 'fs/promises';
+import * as path from 'path';
 
 import { createNotFoundError, createUnknownError, TaskEither } from '@eleven-am/fp';
 
