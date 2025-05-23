@@ -294,8 +294,8 @@ export class HardwareAccelerationDetector {
                 'cuda',
             ],
             outputOptions: {
-                h264: ['-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq'],
-                h265: ['-c:v', 'hevc_nvenc', '-preset', 'p4', '-tune', 'hq'],
+                h264: ['-c:v', 'h264_nvenc', '-preset', 'fast', '-tune', 'hq', '-rc', 'constqp', '-cq', '23'],
+                h265: ['-c:v', 'hevc_nvenc', '-preset', 'fast', '-tune', 'hq', '-rc', 'constqp', '-cq', '25'],
             },
             videoFilters: {
                 scale: 'scale_cuda=w=%width%:h=%height%:force_original_aspect_ratio=decrease',
@@ -322,8 +322,8 @@ export class HardwareAccelerationDetector {
                 'vaapi',
             ],
             outputOptions: {
-                h264: ['-c:v', 'h264_vaapi'],
-                h265: ['-c:v', 'hevc_vaapi'],
+                h264: ['-c:v', 'h264_vaapi', '-qp', '23'],
+                h265: ['-c:v', 'hevc_vaapi', '-qp', '25'],
             },
             videoFilters: {
                 scale: 'scale_vaapi=w=%width%:h=%height%:force_original_aspect_ratio=decrease',
@@ -340,8 +340,8 @@ export class HardwareAccelerationDetector {
             method: HardwareAccelerationMethod.VIDEOTOOLBOX,
             inputOptions: [],
             outputOptions: {
-                h264: ['-c:v', 'h264_videotoolbox', '-q:v', '50'],
-                h265: ['-c:v', 'hevc_videotoolbox', '-q:v', '50'],
+                h264: ['-c:v', 'h264_videotoolbox', '-q:v', '30'],
+                h265: ['-c:v', 'hevc_videotoolbox', '-q:v', '32'],
             },
             videoFilters: {
                 scale: 'scale=w=%width%:h=%height%:force_original_aspect_ratio=decrease',
@@ -363,11 +363,11 @@ export class HardwareAccelerationDetector {
                 'qsv',
             ],
             outputOptions: {
-                h264: ['-c:v', 'h264_qsv'],
-                h265: ['-c:v', 'hevc_qsv'],
+                h264: ['-c:v', 'h264_qsv', '-q', '23'],
+                h265: ['-c:v', 'hevc_qsv', '-q', '25'],
             },
             videoFilters: {
-                scale: 'scale_qsv=w=%width%:h=%height%:force_original_aspect_ratio=decrease',
+                scale: 'scale_qsv=w=%width%:h=%height%',
             },
         };
     }
