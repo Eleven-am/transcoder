@@ -1,9 +1,17 @@
 import * as path from 'path';
 
-import { createBadRequestError, createInternalError, Either, Result, sortBy, TaskEither } from '@eleven-am/fp';
+import {
+    createBadRequestError,
+    createInternalError,
+    createNotFoundError,
+    Either,
+    Result,
+    sortBy,
+    TaskEither,
+} from '@eleven-am/fp';
 
 import { defer, Deferred } from './deferred';
-import ffmpeg from './ffmpeg';
+import ffmpeg, { FfmpegCommand } from './ffmpeg';
 import { HardwareAccelerationDetector } from './hardwareAccelerationDetector';
 import { MediaSource } from './mediaSource';
 import { MetadataService } from './metadataService';
@@ -15,6 +23,9 @@ import {
     FFMPEGOptions,
     HardwareAccelerationConfig,
     MediaMetadata,
+    StreamConfig,
+    StreamMetrics,
+    StreamMetricsEvent,
     StreamType,
     SubtitleInfo,
     TranscodeJob,
@@ -37,6 +48,8 @@ interface StreamEventMap {
     'transcode:queued': TranscodeJob;
     'transcode:error': { job: TranscodeJob, error: Error };
     'transcode:start': TranscodeJob;
+    'transcode:fallback': { job: TranscodeJob, from: string, to: string };
+    'stream:metrics': StreamMetricsEvent;
     'dispose': { id: string };
 }
 
@@ -52,7 +65,16 @@ interface JobRange {
     status: JobRangeStatus;
 }
 
-type ArgsBuilder = (segments: string) => FFMPEGOptions;
+interface FfmpegProgress {
+    segment: number;
+    currentTime: number;
+    targetSize: number;
+    currentBitrate: number;
+    targetBitrate: number;
+    speed: number;
+}
+
+type ArgsBuilder = (segments: string) => Either<FFMPEGOptions>;
 
 interface DetailedVideoQuality extends VideoQuality {
     width: number;
@@ -60,7 +82,15 @@ interface DetailedVideoQuality extends VideoQuality {
 }
 
 export class Stream extends ExtendedEventEmitter<StreamEventMap> {
-    private static readonly DISPOSE_TIMEOUT = 30 * 60 * 1000;
+    private static readonly DEFAULT_CONFIG: StreamConfig = {
+        disposeTimeout: 30 * 60 * 1000,
+        maxEncoderDistance: 60,
+        segmentTimeout: 60_000,
+        enableHardwareAccelFallback: true,
+        retryFailedSegments: true,
+        metricsInterval: 30_000,
+        maxRetries: 3,
+    };
 
     private readonly videoQuality: VideoQuality | null;
 
@@ -70,7 +100,23 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     private readonly jobRange: JobRange[];
 
+    private readonly config: StreamConfig;
+
+    private readonly metrics: StreamMetrics;
+
+    private readonly cachedHwOptions: Map<string, FFMPEGOptions>;
+
+    private readonly segmentRetries: Map<number, number>;
+
     private timer: NodeJS.Timeout | null;
+
+    private hasFallenBackToSoftware: boolean;
+
+    private readonly streamCreatedAt: number;
+
+    private lastActivityAt: number;
+
+    private metricsTimer: NodeJS.Timeout | null;
 
     private constructor (
         private readonly quality: string,
@@ -82,9 +128,12 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         private readonly qualityService: QualityService,
         private readonly hwDetector: HardwareAccelerationDetector,
         private readonly optimisedAccel: HardwareAccelerationConfig | null,
+        config: Partial<StreamConfig>,
     ) {
         super();
 
+        this.config = { ...Stream.DEFAULT_CONFIG,
+            ...config };
         const [aQ, vQ] = this.loadQuality();
 
         this.segments = this.buildSegments();
@@ -92,19 +141,35 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         this.audioQuality = aQ;
         this.jobRange = [];
         this.timer = null;
+        this.hasFallenBackToSoftware = false;
+        this.streamCreatedAt = Date.now();
+        this.lastActivityAt = this.streamCreatedAt;
+        this.metricsTimer = null;
+        this.cachedHwOptions = new Map();
+        this.segmentRetries = new Map();
+        this.metrics = {
+            segmentsProcessed: 0,
+            segmentsFailed: 0,
+            averageProcessingTime: 0,
+            hardwareAccelUsed: Boolean(optimisedAccel),
+            fallbacksToSoftware: 0,
+            totalJobsStarted: 0,
+            totalJobsCompleted: 0,
+        };
     }
 
     /**
      * Create a new stream
-     * @param quality The quality of the stream
-     * @param type The type of the stream
-     * @param streamIndex The index of the stream
-     * @param source The source of the stream
-     * @param maxSegmentBatchSize The maximum number of segments to process at once
-     * @param qualityService The quality service
-     * @param metadataService The metadata service
-     * @param hwDetector The hardware acceleration detector
-     * @param hwAccel The hardware acceleration configuration
+     * @param quality - The quality of the stream
+     * @param type - The type of the stream (audio or video)
+     * @param streamIndex - The index of the stream
+     * @param source - The media source
+     * @param maxSegmentBatchSize - The maximum number of segments to process at once
+     * @param qualityService - The quality service
+     * @param metadataService - The metadata service
+     * @param hwDetector - The hardware acceleration detector
+     * @param hwAccel - The hardware acceleration configuration
+     * @param config - The stream configuration
      */
     static create (
         quality: string,
@@ -116,6 +181,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         metadataService: MetadataService,
         hwDetector: HardwareAccelerationDetector,
         hwAccel: HardwareAccelerationConfig | null,
+        config: Partial<StreamConfig>,
     ): TaskEither<Stream> {
         return TaskEither
             .fromBind({
@@ -132,16 +198,17 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 qualityService,
                 hwDetector,
                 optimisedAccel,
+                config,
             ))
             .chain((stream) => stream.initialise());
     }
 
     /**
      * Get the stream ID
-     * @param fileId The file ID
-     * @param type The type of the stream
-     * @param quality The quality of the stream
-     * @param streamIndex The index of the stream
+     * @param fileId - The file ID
+     * @param type - The type of the stream (audio or video)
+     * @param quality - The quality of the stream
+     * @param streamIndex - The index of the stream
      */
     static getStreamId (fileId: string, type: StreamType, quality: string, streamIndex: number): string {
         return `${fileId}:${type}:${streamIndex}:${quality}`;
@@ -149,9 +216,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Extract subtitle from a media source and convert to WebVTT
-     * @param mediaSource Media source containing the subtitle
-     * @param streamIndex The subtitle stream index to extract
-     * @returns TaskEither containing the VTT content as string
+     * @param mediaSource - The media source
+     * @param streamIndex - The index of the subtitle stream
      */
     static getVTTSubtitle (mediaSource: MediaSource, streamIndex: number): NodeJS.ReadableStream {
         return this.runFFMPEGCommand(
@@ -169,8 +235,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Get all convertible subtitle streams from media metadata
-     * @param metadata Media metadata containing subtitle streams
-     * @returns Array of subtitle streams that can be converted to VTT
+     * @param metadata - The media metadata
      */
     static getConvertibleSubtitles (metadata: MediaMetadata): SubtitleInfo[] {
         return metadata.subtitles.filter((stream) => this.canConvertToVtt(stream));
@@ -178,7 +243,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Check if a subtitle stream can be converted to VTT
-     * @param subtitleStream The subtitle stream to check
+     * @param subtitleStream - The subtitle stream
      */
     private static canConvertToVtt (subtitleStream: SubtitleInfo): boolean {
         const supportedCodecs = [
@@ -202,10 +267,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     *
-     * @param outputOptions
-     * @param inputPath
-     * @private
+     * Run FFMPEG command
+     * @param outputOptions - The output options to feed to the Ffmpeg
+     * @param inputPath - The input path to the file to perform the command on
      */
     private static runFFMPEGCommand (outputOptions: string[], inputPath: string) {
         return ffmpeg(inputPath).outputOptions(outputOptions)
@@ -214,7 +278,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Create a screenshot from a media source at a specific timestamp
-     * @param timestamp The timestamp to take the screenshot at
+     * @param timestamp - The timestamp of the screenshot to be created
      */
     generateScreenshot (timestamp: number): NodeJS.ReadableStream {
         const command = ffmpeg(this.source.getFilePath());
@@ -252,9 +316,23 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
+     * Get stream configuration
+     */
+    getConfig (): StreamConfig {
+        return { ...this.config };
+    }
+
+    /**
+     * Manually trigger metrics emission
+     */
+    emitCurrentMetrics (): void {
+        this.emitMetrics();
+    }
+
+    /**
      * Builds the transcode command for the stream
-     * @param segmentIndex The segment index to build the command for
-     * @param priority The priority of the task
+     * @param segmentIndex - The index of the segment
+     * @param priority - The priority of the segment
      */
     buildTranscodeCommand (segmentIndex: number, priority: number): TaskEither<void> {
         this.debounceDispose();
@@ -272,12 +350,13 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                     run: () => TaskEither.of(undefined),
                 },
                 {
-                    predicate: ({ isScheduled, distance, segment }) => isScheduled && distance <= 60 &&
+                    predicate: ({ isScheduled, distance, segment }) => isScheduled &&
+                        distance <= this.config.maxEncoderDistance &&
                         segment.value?.state() !== 'rejected',
                     run: ({ segment }) => TaskEither
                         .tryTimed(
                             () => segment.value!.promise(),
-                            60_000,
+                            this.config.segmentTimeout,
                         )
                         .mapError(() => createInternalError(`Timed out waiting for segment ${segment.index}`)),
                 },
@@ -294,8 +373,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Get the segment stream for a specific segment
-     * @param segmentIndex The index of the segment to get
-     * @param priority The priority of the task
+     * @param segmentIndex - The index of the segment
+     * @param priority - The priority of the segment
      */
     getSegmentStream (segmentIndex: number, priority: number): TaskEither<NodeJS.ReadableStream> {
         this.debounceDispose();
@@ -340,8 +419,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Builds the video quality for the stream
-     * @param quality The quality to build
-     * @param index The index of the video stream
+     * @param quality - The video quality to build
+     * @param index - The index of the video stream
      */
     buildVideoQuality (quality: VideoQualityEnum, index?: number): DetailedVideoQuality {
         const videoInfo = this.metadata.videos[index ?? this.streamIndex];
@@ -361,48 +440,277 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Builds the audio quality for the stream
-     * @param quality The quality to build
-     * @param index The index of the audio stream
+     * @param quality - The audio quality to build
+     * @param index - The index of the audio stream
      */
     buildAudioQuality (quality: AudioQualityEnum, index?: number): AudioQuality {
         const audioInfo = this.metadata.audios[index ?? this.streamIndex];
-
 
         return this.qualityService.buildValidAudioQuality(quality, audioInfo);
     }
 
     /**
      * Dispose of the stream
-     * @private
      */
     dispose (): Promise<Result<void>> {
+        this.segments.forEach((segment) => {
+            if (segment.value?.state() === 'pending') {
+                segment.value.reject(new Error('Stream disposed'));
+            }
+        });
+
+        this.cachedHwOptions.clear();
+        this.segmentRetries.clear();
+
+
+        this.jobRange.forEach((range) => {
+            if (range.status === JobRangeStatus.PROCESSING) {
+                range.status = JobRangeStatus.ERROR;
+            }
+        });
+
+        if (this.timer) {
+            clearTimeout(this.timer);
+        }
+        if (this.metricsTimer) {
+            clearInterval(this.metricsTimer);
+        }
+
         this.emit('dispose', { id: this.getStreamId() });
 
         return this.source.deleteTempFiles()
             .map(() => {
                 this.segments.clear();
+                this.jobRange.length = 0;
                 this.timer = null;
+                this.metricsTimer = null;
+                this.removeAllListeners();
             })
             .toResult();
+    }
+
+    /**
+     * Generate and emit comprehensive stream metrics
+     */
+    private emitMetrics (): void {
+        this.lastActivityAt = Date.now();
+
+        const segmentStates = this.calculateSegmentStates();
+
+        const avgSegmentDuration = this.metadata.duration / this.segments.size;
+        const remainingSegments = segmentStates.unstarted + segmentStates.pending;
+        const estimatedTimeRemaining = remainingSegments > 0 && this.metrics.averageProcessingTime > 0
+            ? remainingSegments * this.metrics.averageProcessingTime
+            : null;
+
+        const metricsEvent: StreamMetricsEvent = {
+            streamId: this.getStreamId(),
+            fileId: this.metadata.id,
+            type: this.type,
+            quality: this.quality,
+            streamIndex: this.streamIndex,
+
+            metrics: { ...this.metrics },
+
+            isUsingHardwareAcceleration: this.isUsingHardwareAcceleration(),
+            currentAccelerationMethod: this.getCurrentAccelerationMethod(),
+            originalAccelerationMethod: this.optimisedAccel?.method || null,
+            hasFallenBackToSoftware: this.hasFallenBackToSoftware,
+
+            totalSegments: this.segments.size,
+            segmentsCompleted: segmentStates.completed,
+            segmentsPending: segmentStates.pending,
+            segmentsFailed: segmentStates.failed,
+            segmentsUnstarted: segmentStates.unstarted,
+
+            currentJobsActive: this.jobRange.filter((range) => range.status === JobRangeStatus.PROCESSING).length,
+            averageSegmentDuration: avgSegmentDuration,
+            estimatedTimeRemaining,
+
+            streamCreatedAt: this.streamCreatedAt,
+            lastActivityAt: this.lastActivityAt,
+            metricsGeneratedAt: Date.now(),
+        };
+
+        this.emit('stream:metrics', metricsEvent);
+    }
+
+    /**
+     * Calculate current segment states
+     */
+    private calculateSegmentStates (): {
+        completed: number;
+        pending: number;
+        failed: number;
+        unstarted: number;
+    } {
+        let completed = 0;
+        let pending = 0;
+        let failed = 0;
+        let unstarted = 0;
+
+        this.segments.forEach((segment) => {
+            const state = segment.value?.state();
+
+            if (state === 'fulfilled') {
+                completed++;
+            } else if (state === 'pending') {
+                pending++;
+            } else if (state === 'rejected') {
+                failed++;
+            } else {
+                unstarted++;
+            }
+        });
+
+        return { completed,
+            pending,
+            failed,
+            unstarted };
     }
 
     /**
      * Initialize the stream
      */
     private initialise (): TaskEither<Stream> {
-        return this.checkSegmentsStatus().map(() => this);
+        return this.checkSegmentsStatus()
+            .map(() => {
+                this.emitMetrics();
+                this.startPeriodicMetrics();
+
+                return this;
+            });
     }
 
     /**
-     * Get the segment for this stream
-     * @param segment The segment to get
-     * @param priority The priority of the task
-     * @private
+     * 📊 RECOMMENDATION 1: Start periodic metrics emission for dashboards
+     */
+    private startPeriodicMetrics (): void {
+        if (this.config.metricsInterval <= 0) {
+            return;
+        }
+
+        const interval = Math.max(5000, this.config.metricsInterval);
+
+        this.metricsTimer = setInterval(() => {
+            this.emitMetrics();
+            this.trackHardwareHealth();
+        }, interval);
+    }
+
+    /**
+     * Track hardware health based on metrics
+     */
+    private trackHardwareHealth (): void {
+        if (this.metrics.totalJobsStarted === 0) {
+            return;
+        }
+
+        const failureRate = this.metrics.fallbacksToSoftware / this.metrics.totalJobsStarted;
+        const segmentFailureRate = this.metrics.segmentsFailed / (this.metrics.segmentsProcessed + this.metrics.segmentsFailed);
+
+        if (failureRate > 0.1) {
+            console.warn(`High hardware acceleration failure rate: ${(failureRate * 100).toFixed(1)}% (${this.metrics.fallbacksToSoftware}/${this.metrics.totalJobsStarted} jobs failed)`);
+        }
+
+        if (segmentFailureRate > 0.05) {
+            console.warn(`High segment failure rate: ${(segmentFailureRate * 100).toFixed(1)}% (${this.metrics.segmentsFailed} failed segments)`);
+        }
+
+        const recentFailures = this.getRecentFailureCount();
+
+        if (recentFailures >= 3) {
+            console.error('Hardware acceleration consistently failing. Consider switching to software encoding.');
+        }
+    }
+
+    /**
+     * Get a recent failure count (last 5 jobs)
+     */
+    private getRecentFailureCount (): number {
+        return this.hasFallenBackToSoftware ? 3 : 0;
+    }
+
+    /**
+     * Get dynamic batch size based on hardware acceleration
+     */
+    private getDynamicBatchSize (): number {
+        const baseSize = this.maxSegmentBatchSize;
+
+        if (this.isUsingHardwareAcceleration()) {
+            return Math.min(baseSize * 2, 200);
+        }
+
+        return Math.min(baseSize, 50);
+    }
+
+    /**
+     * Get cached hardware acceleration options
+     * Uses optimisedAccel unless we've fallen back to software
+     * @param width - Video width
+     * @param height - Video height
+     * @param codec - Codec type
+     */
+    private getCachedHardwareOptions (width: number, height: number, codec: CodecType): FFMPEGOptions {
+        const hwConfigToUse = this.hasFallenBackToSoftware ? null : this.optimisedAccel;
+        const key = `${width}x${height}-${codec}-${hwConfigToUse?.method || 'software'}`;
+
+        if (!this.cachedHwOptions.has(key)) {
+            const options = this.hwDetector.applyHardwareConfig(
+                hwConfigToUse,
+                width,
+                height,
+                codec,
+            );
+
+            this.cachedHwOptions.set(key, options);
+        }
+
+        return this.cachedHwOptions.get(key)!;
+    }
+
+    /**
+     * Check if an error is related to hardware acceleration
+     * @param err - The error to check
+     */
+    private isHardwareAccelerationError (err: Error): boolean {
+        const message = err.message.toLowerCase();
+
+        return message.includes('device creation failed') ||
+            message.includes('hardware device setup failed') ||
+            message.includes('nvenc') ||
+            message.includes('vaapi') ||
+            message.includes('qsv') ||
+            message.includes('videotoolbox') ||
+            message.includes('cuda') ||
+            message.includes('hardware acceleration');
+    }
+
+    /**
+     * Fallback to software encoding while preserving the original optimized config
+     */
+    private fallbackToSoftwareEncoding (): void {
+        if (this.optimisedAccel && this.config.enableHardwareAccelFallback && !this.hasFallenBackToSoftware) {
+            const previousMethod = this.optimisedAccel.method;
+
+            this.hasFallenBackToSoftware = true;
+            this.cachedHwOptions.clear();
+            this.metrics.fallbacksToSoftware++;
+            this.metrics.hardwareAccelUsed = false;
+
+            console.warn(`Falling back from ${previousMethod} to software encoding`);
+        }
+    }
+
+    /**
+     * Get the segment for this stream (Audio)
+     * @param segment - The segment to process
+     * @param priority - The priority of the segment
      */
     private buildAudioTranscodeOptions (segment: Segment, priority: number): TaskEither<void> {
         const argsBuilder: ArgsBuilder = () => {
             if (this.audioQuality?.value === AudioQualityEnum.ORIGINAL) {
-                return {
+                return Either.of({
                     videoFilters: undefined,
                     inputOptions: [],
                     outputOptions: [
@@ -412,10 +720,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                         'copy',
                         '-vn',
                     ],
-                };
+                });
             }
 
-            return {
+            return Either.of({
                 videoFilters: undefined,
                 inputOptions: [],
                 outputOptions: [
@@ -429,7 +737,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                     '128k',
                     '-vn',
                 ],
-            };
+            });
         };
 
         return this.buildFFMPEGCommand(segment, argsBuilder, priority);
@@ -437,9 +745,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Build the FFMPEG command for video transcoding
-     * @param segment The segment to start processing from
-     * @param priority The priority of the task
-     * @private
+     * @param segment - The segment to process
+     * @param priority - The priority of the segment
      */
     private buildVideoTranscodeOptions (segment: Segment, priority: number): TaskEither<void> {
         const video = this.metadata.videos[this.streamIndex];
@@ -447,7 +754,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
         const argsBuilderFactory = (video: VideoInfo, videoQuality: VideoQuality): ArgsBuilder => (segments) => {
             if (videoQuality.value === VideoQualityEnum.ORIGINAL) {
-                return {
+                return Either.of({
                     inputOptions: [],
                     outputOptions: [
                         '-map',
@@ -460,7 +767,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                         '-2',
                     ],
                     videoFilters: undefined,
-                };
+                });
             }
 
             const detailedQuality = this.buildVideoQuality(videoQuality.value);
@@ -468,8 +775,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 ? 'h265'
                 : 'h264';
 
-            const options = this.hwDetector.applyHardwareConfig(
-                this.optimisedAccel,
+            const options = this.getCachedHardwareOptions(
                 detailedQuality.width,
                 detailedQuality.height,
                 codec,
@@ -493,11 +799,11 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 '-2',
             ];
 
-            return {
+            return Either.of({
                 videoFilters: options.videoFilters,
                 inputOptions: options.inputOptions,
                 outputOptions,
-            };
+            });
         };
 
         return TaskEither
@@ -511,7 +817,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Build the segments for this stream
-     * @private
      */
     private buildSegments (): Map<number, Segment> {
         return this.metadata.keyframes.reduce((segments, startTime, index) => {
@@ -532,7 +837,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Check the status of the segments
-     * @private
      */
     private checkSegmentsStatus (): TaskEither<void> {
         return TaskEither
@@ -543,8 +847,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Check if the segment file exists
-     * @param segment The segment to check
-     * @private
+     * @param segment - The segment to check
      */
     private checkSegmentFileStatus (segment: Segment): TaskEither<void> {
         return this.source.segmentExist(this.type, this.streamIndex, this.quality, segment.index)
@@ -558,45 +861,68 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Get the segments to process
-     * @param segment The segment to start processing from
-     * @private
+     * Intelligently filter and prepare segments for processing
+     * Only processes segments that actually need work, respects ongoing jobs
+     * @param initialSegment - The segment to start processing from
      */
-    private getSegments (segment: Segment): Segment[] {
-        const segments = sortBy(Array.from(this.segments.values()), 'index', 'asc');
-        const startIndex = segments.findIndex((s) => segment.index === s.index);
+    private filterAndPrepareSegments (initialSegment: Segment): Segment[] {
+        const allSegments = sortBy(Array.from(this.segments.values()), 'index', 'asc');
+        const startIndex = allSegments.findIndex((s) => s.index === initialSegment.index);
 
         if (startIndex === -1) {
+            console.warn(`Initial segment ${initialSegment.index} not found in segments map`);
+
             return [];
         }
 
-        let endIndex = Math.min(startIndex + this.maxSegmentBatchSize, segments.length);
+        const segmentsToProcess: Segment[] = [];
+        const dynamicBatchSize = this.getDynamicBatchSize();
+        const endIndex = Math.min(startIndex + dynamicBatchSize, allSegments.length);
+
+        console.log(`Using batch size: ${dynamicBatchSize} (hardware: ${this.isUsingHardwareAcceleration() ? 'enabled' : 'disabled'})`);
 
         for (let i = startIndex; i < endIndex; i++) {
-            const currentSegment = segments[i];
+            const segment = allSegments[i];
+            const state = segment.value?.state();
 
-            if (currentSegment.value?.state() === 'pending' ||
-                currentSegment.value?.state() === 'fulfilled') {
-                endIndex = i;
+            if (state === 'pending') {
+                console.log(`Segment ${segment.index} already processing (state: pending), stopping batch at index ${i}`);
                 break;
             }
 
-            if (currentSegment.value?.state() === 'rejected') {
-                currentSegment.value.reset();
+            if (state === 'fulfilled') {
+                console.log(`Segment ${segment.index} already completed (state: fulfilled), stopping batch at index ${i}`);
+                break;
+            }
+
+            if (!segment.value || state === 'rejected') {
+                if (state === 'rejected') {
+                    console.log(`Resetting failed segment ${segment.index} for retry`);
+                    segment.value!.reset();
+                } else {
+                    console.log(`Preparing unstarted segment ${segment.index} for processing`);
+                }
+
+                segment.value = defer<void>();
+                segmentsToProcess.push(segment);
             }
         }
 
-        return segments.slice(startIndex, endIndex);
+        if (segmentsToProcess.length === 0) {
+            console.log(`No segments need processing starting from ${initialSegment.index} - all are pending/fulfilled`);
+        } else {
+            console.log(`Prepared ${segmentsToProcess.length} segments for processing: [${segmentsToProcess.map((s) => s.index).join(', ')}]`);
+        }
+
+        return segmentsToProcess;
     }
 
     /**
      * Generate FFMPEG transcoding arguments for processing segments
-     * @param builder Function to build codec-specific options
-     * @param segments The segments to process
      */
-    private getTranscodeArgs (builder: ArgsBuilder, segments: Segment[]): FFMPEGOptions {
+    private getTranscodeArgs (builder: ArgsBuilder, segments: Segment[]): Either<FFMPEGOptions> {
         if (segments.length === 0) {
-            throw new Error(`No segments to process for stream ${this.type} ${this.streamIndex} ${this.quality}`);
+            return Either.error(createNotFoundError(`No segments to process for stream ${this.type} ${this.streamIndex} ${this.quality}`));
         }
 
         const startSegment = segments[0];
@@ -665,151 +991,347 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
         options.inputOptions.push('-fflags', '+genpts');
 
-        const transcodeArgs = builder(segmentTimestamps);
-
-        options.outputOptions.push(
-            '-start_at_zero',
-            '-copyts',
-            '-muxdelay',
-            '0',
-            '-f',
-            'segment',
-            '-segment_time_delta',
-            '0.05',
-            '-segment_format',
-            'mpegts',
-            '-segment_times',
-            relativeTimestamps,
-            '-segment_list_type',
-            'flat',
-            '-segment_list',
-            'pipe:1',
-            '-segment_start_number',
-            startKeyframeIndex.toString(),
-        );
-
-        return {
-            inputOptions: [
-                ...options.inputOptions,
-                ...transcodeArgs.inputOptions,
-            ],
-            outputOptions: [
-                ...options.outputOptions,
-                ...transcodeArgs.outputOptions,
-            ],
-            videoFilters: transcodeArgs.videoFilters,
-        };
+        return builder(segmentTimestamps)
+            .map((transcodeArgs) => ({
+                inputOptions: [
+                    ...options.inputOptions,
+                    ...transcodeArgs.inputOptions,
+                ],
+                outputOptions: [
+                    ...options.outputOptions,
+                    ...transcodeArgs.outputOptions,
+                    '-start_at_zero',
+                    '-copyts',
+                    '-muxdelay',
+                    '0',
+                    '-f',
+                    'segment',
+                    '-segment_time_delta',
+                    '0.05',
+                    '-segment_format',
+                    'mpegts',
+                    '-segment_times',
+                    relativeTimestamps,
+                    '-segment_list_type',
+                    'flat',
+                    '-segment_list',
+                    'pipe:1',
+                    '-segment_start_number',
+                    startKeyframeIndex.toString(),
+                ],
+                videoFilters: transcodeArgs.videoFilters,
+            }));
     }
 
     /**
      * Build the FFMPEG command for transcoding
-     * @param initialSegment The segment to start processing from
-     * @param builder Function to build codec-specific options
-     * @param priority The priority of the task
      */
     private buildFFMPEGCommand (initialSegment: Segment, builder: ArgsBuilder, priority: number): TaskEither<void> {
-        let lastIndex = initialSegment.index;
-        const segments = this.getSegments(initialSegment);
-        const task = Either.tryCatch(() => this.getTranscodeArgs(builder, segments))
-            .toTaskEither();
+        const segmentsToProcess = this.filterAndPrepareSegments(initialSegment);
 
-        const buildCommand = (outputDir: string, options: FFMPEGOptions) => {
-            const { inputOptions, outputOptions, videoFilters } = options;
+        if (segmentsToProcess.length === 0) {
+            console.log(`No new segments to process, waiting for existing job to complete segment ${initialSegment.index}`);
 
-            segments.forEach((segment) => segment.value = defer<void>());
-            const command = ffmpeg(this.source.getFilePath())
-                .inputOptions(inputOptions)
-                .outputOptions(outputOptions);
+            return TaskEither.tryCatch(() => initialSegment.value!.promise());
+        }
 
-            const jobRange: JobRange = {
-                start: initialSegment.start,
-                status: JobRangeStatus.PROCESSING,
-                end: segments[segments.length - 1].duration,
-            };
-
-            const job: TranscodeJob = {
-                id: `job-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+        return this.getTranscodeArgs(builder, segmentsToProcess)
+            .toTaskEither()
+            .chain((options) => this.source.getStreamDirectory(this.type, this.streamIndex, this.quality)
+                .map((outputDir) => ({ options,
+                    outputDir })))
+            .chain(({ options, outputDir }) => this.executeTranscodeCommand(
+                initialSegment,
+                segmentsToProcess,
+                options,
+                outputDir,
                 priority,
-                process: command,
-                createdAt: Date.now(),
-                start: initialSegment.start,
-                status: TranscodeStatus.QUEUED,
-            };
-
-            const disposeHandler = () => {
-                command.kill('SIGINT');
-                this.off('dispose', disposeHandler);
-            };
-
-            if (videoFilters) {
-                command.videoFilters(videoFilters);
-            }
-
-            command.output(path.join(outputDir, 'segment-%d.ts'));
-
-            command.on('start', () => {
-                job.status = TranscodeStatus.PROCESSING;
-                this.emit('transcode:start', job);
-            });
-
-            command.on('progress', (progress) => {
-                const segmentIndex = progress.segment;
-
-                lastIndex = segmentIndex;
-                const segment = this.segments.get(segmentIndex);
-                const nextSegment = this.segments.get(segmentIndex + 1);
-
-                if (nextSegment && nextSegment.value?.state() === 'fulfilled') {
-                    // command.kill('SIGINT');
-                }
-
-                if (segment) {
-                    // eslint-disable-next-line no-unused-expressions,@typescript-eslint/no-unused-expressions
-                    segment.value ? segment.value.resolve() : segment.value = defer<void>().resolve();
-                }
-            });
-
-            command.on('end', () => {
-                job.status = TranscodeStatus.PROCESSED;
-                jobRange.status = JobRangeStatus.PROCESSED;
-                this.emit('transcode:complete', job);
-                this.off('dispose', disposeHandler);
-            });
-
-            command.on('error', (err) => {
-                const unprocessedSegments = segments.filter((segment) => segment.index > lastIndex && segment.value!.state() === 'pending');
-
-                unprocessedSegments.forEach((segment) => segment.value!.reject(err));
-
-                job.status = TranscodeStatus.ERROR;
-                jobRange.status = JobRangeStatus.ERROR;
-                this.emit('transcode:error', {
-                    job,
-                    error: err,
-                });
-                this.off('dispose', disposeHandler);
-            });
-
-            this.on('dispose', disposeHandler);
-            this.emit('transcode:queued', job);
-            this.jobRange.push(jobRange);
-        };
-
-        return TaskEither
-            .fromBind({
-                outputDir: this.source.getStreamDirectory(this.type, this.streamIndex, this.quality),
-                options: task,
-            })
-            .map(({ outputDir, options }) => buildCommand(outputDir, options))
-            .orElse(() => TaskEither.of(undefined))
-            .fromPromise(() => initialSegment.value!.promise());
+            ))
+            .chain(() => TaskEither.tryCatch(() => initialSegment.value!.promise()));
     }
 
     /**
-     * calculate the closest multiple of x to n
-     * @param n
-     * @param x
-     * @private
+     * Execute the actual Ffmpeg transcoding command
+     */
+    private executeTranscodeCommand (
+        initialSegment: Segment,
+        segments: Segment[],
+        options: FFMPEGOptions,
+        outputDir: string,
+        priority: number,
+    ): TaskEither<void> {
+        return TaskEither.tryCatch(
+            () => this.setupAndRunCommand(initialSegment, segments, options, outputDir, priority),
+            'Failed to execute transcode command',
+        );
+    }
+
+    /**
+     * Setup and run the Ffmpeg command with proper event handling
+     */
+    private setupAndRunCommand (
+        initialSegment: Segment,
+        segments: Segment[],
+        options: FFMPEGOptions,
+        outputDir: string,
+        priority: number,
+    ): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const command = this.createFfmpegCommand(options, outputDir);
+            const job = this.createTranscodeJob(initialSegment, priority, command);
+            const jobRange = this.createJobRange(initialSegment, segments);
+
+            this.setupCommandEventHandlers(command, job, jobRange, segments, resolve, reject);
+
+            this.emit('transcode:queued', job);
+            this.jobRange.push(jobRange);
+            this.metrics.totalJobsStarted++;
+        });
+    }
+
+    /**
+     * Create the Ffmpeg command with options
+     */
+    private createFfmpegCommand (options: FFMPEGOptions, outputDir: string): FfmpegCommand {
+        const { inputOptions, outputOptions, videoFilters } = options;
+
+        const command = ffmpeg(this.source.getFilePath())
+            .inputOptions(inputOptions)
+            .outputOptions(outputOptions)
+            .output(path.join(outputDir, 'segment-%d.ts'));
+
+        if (videoFilters) {
+            command.videoFilters(videoFilters);
+        }
+
+        return command;
+    }
+
+    /**
+     * Create a transcode job
+     */
+    private createTranscodeJob (initialSegment: Segment, priority: number, command: any): TranscodeJob {
+        return {
+            id: `job-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+            priority,
+            process: command,
+            createdAt: Date.now(),
+            start: initialSegment.start,
+            status: TranscodeStatus.QUEUED,
+        };
+    }
+
+    /**
+     * Create a job range
+     */
+    private createJobRange (initialSegment: Segment, segments: Segment[]): JobRange {
+        return {
+            start: initialSegment.start,
+            status: JobRangeStatus.PROCESSING,
+            end: segments[segments.length - 1].duration,
+        };
+    }
+
+    /**
+     * Set up comprehensive event handlers for the Ffmpeg command
+     * @param command - The Ffmpeg command
+     * @param job - The transcode job
+     * @param jobRange - The job range
+     * @param segments - The segments being processed
+     * @param resolve - Resolve function
+     * @param reject - Reject function
+     */
+    private setupCommandEventHandlers (
+        command: any,
+        job: TranscodeJob,
+        jobRange: JobRange,
+        segments: Segment[],
+        resolve: () => void,
+        reject: (error: Error) => void,
+    ): void {
+        let lastIndex = segments[0].index;
+        const startTime = Date.now();
+
+        const disposeHandler = () => {
+            command.kill('SIGINT');
+            this.off('dispose', disposeHandler);
+            reject(new Error('Stream disposed during transcoding'));
+        };
+
+        command.on('start', () => {
+            job.status = TranscodeStatus.PROCESSING;
+            this.emit('transcode:start', job);
+            this.emitMetrics();
+        });
+
+        command.on('progress', (progress: FfmpegProgress) => {
+            lastIndex = progress.segment;
+            this.handleSegmentProgress(progress.segment, segments);
+            // Note: Could emit metrics here but might be too frequent
+            // this.emitMetrics(); // Uncomment for real-time segment updates
+        });
+
+        command.on('end', () => {
+            const processingTime = Date.now() - startTime;
+
+            this.updateMetricsOnSuccess(segments.length, processingTime);
+
+            job.status = TranscodeStatus.PROCESSED;
+            jobRange.status = JobRangeStatus.PROCESSED;
+            this.emit('transcode:complete', job);
+            this.emitMetrics();
+            this.off('dispose', disposeHandler);
+            resolve();
+        });
+
+        command.on('error', (err: Error) => {
+            this.handleTranscodeError(err, job, jobRange, segments, lastIndex, disposeHandler);
+
+            if (this.shouldRetryWithFallback(err, segments[0].index)) {
+                this.retryWithFallback(segments[0], job, resolve, reject);
+            } else {
+                this.emitMetrics();
+                reject(err);
+            }
+        });
+
+        this.on('dispose', disposeHandler);
+    }
+
+    /**
+     * Handle segment progress updates
+     * @param segmentIndex - The index of the segment
+     * @param segments - The segments being processed
+     */
+    private handleSegmentProgress (segmentIndex: number, segments: Segment[]): void {
+        const segment = this.segments.get(segmentIndex);
+        const nextSegment = this.segments.get(segmentIndex + 1);
+
+        // Stop early if next segment is already fulfilled
+        if (nextSegment && nextSegment.value?.state() === 'fulfilled') {
+            // Optionally kill command early for efficiency
+            // command.kill('SIGINT');
+        }
+
+        if (segment) {
+            // Resolve segment or create resolved deferred
+            segment.value = segment.value?.resolve() ?? defer<void>().resolve();
+            this.metrics.segmentsProcessed++;
+        }
+    }
+
+    /**
+     * Handle transcoding errors with potential hardware acceleration fallback
+     * @param err - The error that occurred
+     * @param job - The job that was processing
+     * @param jobRange - The job range that was processing
+     * @param segments - The segments that were being processed
+     * @param lastIndex - The last index processed
+     * @param disposeHandler - The dispose handler to call
+     */
+    private handleTranscodeError (
+        err: Error,
+        job: TranscodeJob,
+        jobRange: JobRange,
+        segments: Segment[],
+        lastIndex: number,
+        disposeHandler: () => void,
+    ): void {
+        // Reject unprocessed segments
+        const unprocessedSegments = segments.filter((segment) => segment.index > lastIndex && segment.value?.state() === 'pending');
+
+        unprocessedSegments.forEach((segment) => {
+            segment.value?.reject(err);
+            this.metrics.segmentsFailed++;
+        });
+
+        // Update job status
+        job.status = TranscodeStatus.ERROR;
+        jobRange.status = JobRangeStatus.ERROR;
+
+        // Emit error
+        this.emit('transcode:error', { job,
+            error: err });
+
+        // Cleanup
+        this.off('dispose', disposeHandler);
+    }
+
+    /**
+     * Check if we should retry with fallback
+     * @param err - The error to check
+     * @param segmentIndex - The index of the segment
+     */
+    private shouldRetryWithFallback (err: Error, segmentIndex: number): boolean {
+        if (!this.config.enableHardwareAccelFallback || !this.optimisedAccel || this.hasFallenBackToSoftware) {
+            return false;
+        }
+
+        if (!this.isHardwareAccelerationError(err)) {
+            return false;
+        }
+
+        const retryCount = this.segmentRetries.get(segmentIndex) || 0;
+
+        return retryCount < this.config.maxRetries;
+    }
+
+    /**
+     * Retry transcoding with software fallback
+     * @param segment - The segment to retry
+     * @param originalJob - The original job
+     * @param resolve - Resolve function
+     * @param reject - Reject function
+     */
+    private retryWithFallback (
+        segment: Segment,
+        originalJob: TranscodeJob,
+        resolve: () => void,
+        reject: (error: Error) => void,
+    ): void {
+        const previousMethod = this.optimisedAccel?.method || 'unknown';
+
+        this.fallbackToSoftwareEncoding();
+
+        const retryCount = (this.segmentRetries.get(segment.index) || 0) + 1;
+
+        this.segmentRetries.set(segment.index, retryCount);
+
+        this.emit('transcode:fallback', {
+            job: originalJob,
+            from: previousMethod,
+            to: 'software',
+        });
+
+        this.emitMetrics();
+
+        const retryAction = this.type === StreamType.AUDIO
+            ? this.buildAudioTranscodeOptions(segment, originalJob.priority)
+            : this.buildVideoTranscodeOptions(segment, originalJob.priority);
+
+        return void retryAction
+            .ioSync(() => resolve())
+            .ioErrorSync(({ error }) => reject(error))
+            .toResult();
+    }
+
+    /**
+     * Update metrics on successful completion
+     * @param segmentCount - Number of segments processed
+     * @param processingTime - Time taken to process segments
+     */
+    private updateMetricsOnSuccess (segmentCount: number, processingTime: number): void {
+        this.metrics.totalJobsCompleted++;
+
+        // Update average processing time
+        const totalJobs = this.metrics.totalJobsCompleted;
+
+        this.metrics.averageProcessingTime =
+            (this.metrics.averageProcessingTime * (totalJobs - 1) + processingTime) / totalJobs;
+    }
+
+    /**
+     * Calculate the closest multiple of x to n
      */
     private closestMultiple (n: number, x: number): number {
         if (x > n) {
@@ -824,7 +1346,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Load the quality of the stream
-     * @private
      */
     private loadQuality (): [AudioQuality | null, VideoQuality | null] {
         if (this.type === StreamType.AUDIO) {
@@ -838,7 +1359,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Debounce the dispose method
-     * @private
      */
     private debounceDispose (): void {
         if (this.timer) {
@@ -847,12 +1367,12 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
         this.timer = setTimeout(() => {
             this.dispose();
-        }, Stream.DISPOSE_TIMEOUT);
+        }, this.config.disposeTimeout);
     }
 
     /**
      * Calculate distance from current encoders to a segment
-     * @param segmentIndex The segment to calculate distance to
+     * @param segmentIndex - The index of the segment
      */
     private getMinEncoderDistance (segmentIndex: number): number {
         const segment = this.segments.get(segmentIndex);
@@ -878,7 +1398,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
     /**
      * Check if a segment is already scheduled for processing
-     * @param segmentIndex The segment index to check
+     * @param segmentIndex - The index of the segment
      */
     private isSegmentScheduled (segmentIndex: number): boolean {
         const segment = this.segments.get(segmentIndex);
@@ -890,5 +1410,23 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         return this.jobRange.some((range) => range.status === JobRangeStatus.PROCESSING &&
             segment.start >= range.start &&
             segment.start <= (range.start + range.end));
+    }
+
+    /**
+     * Check if hardware acceleration is being used
+     */
+    private isUsingHardwareAcceleration (): boolean {
+        return Boolean(this.optimisedAccel) && !this.hasFallenBackToSoftware;
+    }
+
+    /**
+     * Get the current acceleration method
+     */
+    private getCurrentAccelerationMethod (): string {
+        if (this.hasFallenBackToSoftware) {
+            return 'software';
+        }
+
+        return this.optimisedAccel?.method || 'software';
     }
 }

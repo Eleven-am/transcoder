@@ -112,7 +112,59 @@ export interface HLSManagerOptions {
     maxSegmentBatchSize?: number;
     videoQualities?: VideoQualityEnum[];
     audioQualities?: AudioQualityEnum[];
+    config?: Partial<StreamConfig>;
 }
+
+export interface StreamConfig {
+    disposeTimeout: number;
+    maxEncoderDistance: number;
+    segmentTimeout: number;
+    enableHardwareAccelFallback: boolean;
+    retryFailedSegments: boolean;
+    maxRetries: number;
+    metricsInterval: number;
+}
+
+export interface StreamMetrics {
+    segmentsProcessed: number;
+    segmentsFailed: number;
+    averageProcessingTime: number;
+    hardwareAccelUsed: boolean;
+    fallbacksToSoftware: number;
+    totalJobsStarted: number;
+    totalJobsCompleted: number;
+}
+
+export interface StreamMetricsEvent {
+    streamId: string;
+    fileId: string;
+    type: StreamType;
+    quality: string;
+    streamIndex: number;
+
+    metrics: StreamMetrics;
+
+    isUsingHardwareAcceleration: boolean;
+    currentAccelerationMethod: string;
+    originalAccelerationMethod: string | null;
+    hasFallenBackToSoftware: boolean;
+
+    totalSegments: number;
+    segmentsCompleted: number;
+    segmentsPending: number;
+    segmentsFailed: number;
+    segmentsUnstarted: number;
+
+    currentJobsActive: number;
+    averageSegmentDuration: number;
+    estimatedTimeRemaining: number | null;
+
+    streamCreatedAt: number;
+    lastActivityAt: number;
+    metricsGeneratedAt: number;
+}
+
+export type StreamMetricsEventHandler = (event: StreamMetricsEvent) => void;
 
 export enum VideoQualityEnum {
     P240 = '240p',

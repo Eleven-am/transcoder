@@ -141,6 +141,45 @@ export interface ClientSession {
     videoProfile: VideoQuality;
 }
 
+export interface StreamMetrics {
+    segmentsProcessed: number;
+    segmentsFailed: number;
+    averageProcessingTime: number;
+    hardwareAccelUsed: boolean;
+    fallbacksToSoftware: number;
+    totalJobsStarted: number;
+    totalJobsCompleted: number;
+}
+
+export interface StreamMetricsEvent {
+    streamId: string;
+    fileId: string;
+    type: StreamType;
+    quality: string;
+    streamIndex: number;
+    
+    metrics: StreamMetrics;
+    
+    isUsingHardwareAcceleration: boolean;
+    currentAccelerationMethod: string;
+    originalAccelerationMethod: string | null;
+    hasFallenBackToSoftware: boolean;
+    
+    totalSegments: number;
+    segmentsCompleted: number;
+    segmentsPending: number;
+    segmentsFailed: number;
+    segmentsUnstarted: number;
+    
+    currentJobsActive: number;
+    averageSegmentDuration: number;
+    estimatedTimeRemaining: number | null;
+    
+    streamCreatedAt: number;
+    lastActivityAt: number;
+    metricsGeneratedAt: number;
+}
+
 /**
  * HLSController is the sole entry point for the HLS package.
  * It is responsible for managing the HLS transcoding process.
@@ -224,6 +263,12 @@ export declare class HLSController {
      * @param callback The callback to call when the session changes
      */
     onSessionChange (callback: (session: ClientSession) => void): void;
+    
+    /**
+     * Sets up a listener for when the stream metrics change
+     * @param callback The callback to call when the metrics change
+     */
+    onStreamMetrics (callback: (metrics: StreamMetricsEvent) => void): void;
     
     /**
      * Create metadata for a media source

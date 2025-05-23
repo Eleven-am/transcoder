@@ -13,6 +13,8 @@ import {
     ClientSession,
     HardwareAccelerationConfig,
     HLSManagerOptions,
+    StreamConfig,
+    StreamMetricsEventHandler,
     StreamType,
     SubtitleInfo,
     TranscodeType,
@@ -21,7 +23,11 @@ import {
 import { streamToString } from './utils';
 
 export class HLSController {
+    readonly streamConfig: Partial<StreamConfig>;
+
     #hwConfig: HardwareAccelerationConfig | null = null;
+
+    #streamMetricsEventHandler: StreamMetricsEventHandler | null = null;
 
     readonly #hwDetector: HardwareAccelerationDetector;
 
@@ -44,6 +50,7 @@ export class HLSController {
 
         this.#hwAccelEnabled = options.hwAccel || false;
         this.#maxSegmentBatchSize = options.maxSegmentBatchSize || 100;
+        this.streamConfig = options.config || {};
 
         this.#hwDetector = new HardwareAccelerationDetector();
         this.#fileStorage = new FileStorage(options.cacheDirectory);
@@ -239,6 +246,14 @@ export class HLSController {
     }
 
     /**
+     * Sets up a listener for when the stream metrics change
+     * @param callback The callback to call when the metrics change
+     */
+    onStreamMetrics (callback: StreamMetricsEventHandler): void {
+        this.#streamMetricsEventHandler = callback;
+    }
+
+    /**
      * Create metadata for a media source
      * @param filePath The file path of the media source
      */
@@ -284,6 +299,12 @@ export class HLSController {
         stream.on('dispose', ({ id }) => {
             this.#streams.delete(id);
         });
+
+        stream.on('stream:metrics', (event) => {
+            if (this.#streamMetricsEventHandler) {
+                this.#streamMetricsEventHandler(event);
+            }
+        });
     }
 
     /**
@@ -308,6 +329,7 @@ export class HLSController {
                 this.#metadataService,
                 this.#hwDetector,
                 this.#hwConfig,
+                this.streamConfig,
             )
             .ioSync((stream) => this.#hookUpStream(stream))
             .ioSync((stream) => this.#streams.set(stream.getStreamId(), stream));
