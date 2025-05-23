@@ -10,11 +10,17 @@
     "build": "rimraf dist && tsc",
     "lint": "eslint --ext .ts src",
     "lint:fix": "eslint --fix --ext .ts src",
-    "copy": "cp package.json dist && cp LICENSE dist && cp src/types.d.ts dist/types.d.ts && cp src/index.d.ts dist/index.d.ts",
+    "copy": "cp package.json dist && cp LICENSE dist && cp README.md dist && cp src/types.d.ts dist/types.d.ts && cp src/index.d.ts dist/index.d.ts",
     "push": "npm version patch && npm run copy && cd dist && npm publish && cd ..",
     "pipeline": "npm run build && npm run push"
   },
-  "keywords": [],
+  "keywords": [
+    "transcode",
+    "hls",
+    "video",
+    "audio",
+    "ffmpeg"
+  ],
   "dependencies": {
     "@eleven-am/fp": "^0.0.24"
   },
@@ -42,7 +48,7 @@
     "tsconfig-paths": "^4.2.0",
     "typescript": "^5.8.3"
   },
-  "author": "",
+  "author": "Roy OSSAI",
   "license": "ISC",
-  "description": ""
+  "description": "Transcoder is a library for transcoding video and audio files. It provides a simple and efficient way to convert media files from one format to another, making it easy to work with different file types and codecs. The library supports a wide range of formats and codecs, allowing users to customize their transcoding process to meet their specific needs."
 }
