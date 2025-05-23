@@ -1187,7 +1187,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             for (const segment of unprocessedSegments) {
                 try {
                     if (segment.value && segment.value.state() === 'pending') {
-                        segment.value.reject(new Error(err.message));
+                        // segment.value.reject(new Error(err.message));
                         rejectedCount++;
                     }
                 } catch (segmentError) {
