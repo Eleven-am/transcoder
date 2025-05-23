@@ -114,8 +114,11 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     ) {
         super();
 
-        this.config = { ...Stream.DEFAULT_CONFIG,
-            ...config };
+        this.config = {
+            ...Stream.DEFAULT_CONFIG,
+            ...config,
+        };
+
         const [aQ, vQ] = this.loadQuality();
 
         this.segments = this.buildSegments();
@@ -1004,8 +1007,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         outputDir: string,
         priority: number,
     ): Promise<void> {
-        console.log(options);
-
         return new Promise((resolve, reject) => {
             const command = this.createFfmpegCommand(options, outputDir);
             const job = this.createTranscodeJob(initialSegment, priority, command);
