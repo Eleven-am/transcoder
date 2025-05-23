@@ -985,7 +985,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                     options,
                     outputDir,
                 })))
-            .ioSync(console.log)
             .chain(({ options, outputDir }) => this.executeTranscodeCommand(
                 initialSegment,
                 segmentsToProcess,
@@ -1041,6 +1040,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     private createFfmpegCommand (options: FFMPEGOptions, outputDir: string): FfmpegCommand {
         const { inputOptions, outputOptions, videoFilters } = options;
 
+        console.log(options);
+
         const command = ffmpeg(this.source.getFilePath())
             .inputOptions(inputOptions)
             .outputOptions(outputOptions)
@@ -1056,7 +1057,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     /**
      * Create a transcode job
      */
-    private createTranscodeJob (initialSegment: Segment, priority: number, command: any): TranscodeJob {
+    private createTranscodeJob (initialSegment: Segment, priority: number, command: FfmpegCommand): TranscodeJob {
         return {
             id: `job-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
             priority,
@@ -1088,7 +1089,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
      * @param reject - Reject function
      */
     private setupCommandEventHandlers (
-        command: any,
+        command: FfmpegCommand,
         job: TranscodeJob,
         jobRange: JobRange,
         segments: Segment[],
@@ -1110,7 +1111,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             this.emitMetrics();
         });
 
-        command.on('progress', (progress: FfmpegProgress) => {
+        command.on('progress', (progress) => {
             lastIndex = progress.segment;
             this.handleSegmentProgress(progress.segment, segments);
             // Note: Could emit metrics here but might be too frequent
