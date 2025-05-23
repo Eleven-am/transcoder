@@ -1040,11 +1040,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     private createFfmpegCommand (options: FFMPEGOptions, outputDir: string): FfmpegCommand {
         const { inputOptions, outputOptions, videoFilters } = options;
 
-        console.log(options);
-
         const command = ffmpeg(this.source.getFilePath())
             .inputOptions(inputOptions)
             .outputOptions(outputOptions)
+            .on('start', console.log)
             .output(path.join(outputDir, 'segment-%d.ts'));
 
         if (videoFilters) {
