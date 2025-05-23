@@ -22,7 +22,7 @@
     "ffmpeg"
   ],
   "dependencies": {
-    "@eleven-am/fp": "^0.0.24"
+    "@eleven-am/fp": "^0.0.26"
   },
   "devDependencies": {
     "@eslint/js": "^9.27.0",

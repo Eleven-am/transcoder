@@ -1,16 +1,7 @@
 import * as path from 'path';
 
-import {
-    createBadRequestError,
-    createInternalError,
-    createNotFoundError,
-    Either,
-    Result,
-    sortBy,
-    TaskEither,
-} from '@eleven-am/fp';
+import { createBadRequestError, createNotFoundError, Deferred, Either, Result, sortBy, TaskEither } from '@eleven-am/fp';
 
-import { defer, Deferred } from './deferred';
 import ffmpeg, { FfmpegCommand } from './ffmpeg';
 import { HardwareAccelerationDetector } from './hardwareAccelerationDetector';
 import { MediaSource } from './mediaSource';
@@ -345,11 +336,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                         distance <= this.config.maxEncoderDistance &&
                         segment.value?.state() !== 'rejected',
                     run: ({ segment }) => TaskEither
-                        .tryTimed(
-                            () => segment.value!.promise(),
-                            this.config.segmentTimeout,
-                        )
-                        .mapError(() => createInternalError(`Timed out waiting for segment ${segment.index}`)),
+                        .fromResult(() => segment.value!.promise())
+                        .timed(this.config.segmentTimeout, `Timed out waiting for segment ${segment.index}`),
                 },
                 {
                     predicate: () => this.type === StreamType.AUDIO,
@@ -811,7 +799,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 () => createBadRequestError(`Segment ${segment.index} does not yet exist`),
             )
             .map(() => {
-                segment.value = defer<void>().resolve();
+                segment.value = Deferred.create<void>().resolve();
             });
     }
 
@@ -849,7 +837,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                     segment.value!.reset();
                 }
 
-                segment.value = defer<void>();
+                segment.value = Deferred.create();
                 segmentsToProcess.push(segment);
             }
         }
@@ -970,7 +958,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         const segmentsToProcess = this.filterAndPrepareSegments(initialSegment);
 
         if (segmentsToProcess.length === 0) {
-            return TaskEither.tryCatch(() => initialSegment.value!.promise());
+            return TaskEither.fromResult(() => initialSegment.value!.promise());
         }
 
         return this.getTranscodeArgs(builder, segmentsToProcess)
@@ -987,7 +975,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 outputDir,
                 priority,
             ))
-            .chain(() => TaskEither.tryCatch(() => initialSegment.value!.promise()));
+            .chain(() => TaskEither.fromResult(() => initialSegment.value!.promise()));
     }
 
     /**
@@ -1157,7 +1145,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         }
 
         if (segment) {
-            segment.value = segment.value?.resolve() ?? defer<void>().resolve();
+            segment.value = segment.value?.resolve() ?? Deferred.create<void>().resolve();
             this.metrics.segmentsProcessed++;
         }
     }
