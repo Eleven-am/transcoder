@@ -426,10 +426,11 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         const videoInfo = this.metadata.videos[index ?? this.streamIndex];
         const profile = this.qualityService.buildValidVideoQuality(quality, videoInfo);
 
-        const height = profile.height;
-        let width = Math.round((height / videoInfo.height) * videoInfo.width);
+        const targetWidth = Math.round((profile.height / videoInfo.height) * videoInfo.width);
+        const targetHeight = profile.height;
 
-        width = this.closestMultiple(width, 2);
+        const width = this.closestMultiple(targetWidth, 2);
+        const height = this.closestMultiple(targetHeight, 2);
 
         return {
             ...profile,
