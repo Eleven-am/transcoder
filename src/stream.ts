@@ -592,43 +592,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
         const interval = Math.max(5000, this.config.metricsInterval);
 
-        this.metricsTimer = setInterval(() => {
-            this.emitMetrics();
-            this.trackHardwareHealth();
-        }, interval);
-    }
-
-    /**
-     * Track hardware health based on metrics
-     */
-    private trackHardwareHealth (): void {
-        if (this.metrics.totalJobsStarted === 0) {
-            return;
-        }
-
-        const failureRate = this.metrics.fallbacksToSoftware / this.metrics.totalJobsStarted;
-        const segmentFailureRate = this.metrics.segmentsFailed / (this.metrics.segmentsProcessed + this.metrics.segmentsFailed);
-
-        if (failureRate > 0.1) {
-            console.warn(`High hardware acceleration failure rate: ${(failureRate * 100).toFixed(1)}% (${this.metrics.fallbacksToSoftware}/${this.metrics.totalJobsStarted} jobs failed)`);
-        }
-
-        if (segmentFailureRate > 0.05) {
-            console.warn(`High segment failure rate: ${(segmentFailureRate * 100).toFixed(1)}% (${this.metrics.segmentsFailed} failed segments)`);
-        }
-
-        const recentFailures = this.getRecentFailureCount();
-
-        if (recentFailures >= 3) {
-            console.error('Hardware acceleration consistently failing. Consider switching to software encoding.');
-        }
-    }
-
-    /**
-     * Get a recent failure count (last 5 jobs)
-     */
-    private getRecentFailureCount (): number {
-        return this.hasFallenBackToSoftware ? 3 : 0;
+        this.metricsTimer = setInterval(() => this.emitMetrics(), interval);
     }
 
     /**
@@ -691,14 +655,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
      */
     private fallbackToSoftwareEncoding (): void {
         if (this.optimisedAccel && this.config.enableHardwareAccelFallback && !this.hasFallenBackToSoftware) {
-            const previousMethod = this.optimisedAccel.method;
-
             this.hasFallenBackToSoftware = true;
             this.cachedHwOptions.clear();
             this.metrics.fallbacksToSoftware++;
             this.metrics.hardwareAccelUsed = false;
-
-            console.warn(`Falling back from ${previousMethod} to software encoding`);
         }
     }
 
@@ -870,8 +830,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         const startIndex = allSegments.findIndex((s) => s.index === initialSegment.index);
 
         if (startIndex === -1) {
-            console.warn(`Initial segment ${initialSegment.index} not found in segments map`);
-
             return [];
         }
 
@@ -879,39 +837,26 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         const dynamicBatchSize = this.getDynamicBatchSize();
         const endIndex = Math.min(startIndex + dynamicBatchSize, allSegments.length);
 
-        console.log(`Using batch size: ${dynamicBatchSize} (hardware: ${this.isUsingHardwareAcceleration() ? 'enabled' : 'disabled'})`);
-
         for (let i = startIndex; i < endIndex; i++) {
             const segment = allSegments[i];
             const state = segment.value?.state();
 
             if (state === 'pending') {
-                console.log(`Segment ${segment.index} already processing (state: pending), stopping batch at index ${i}`);
                 break;
             }
 
             if (state === 'fulfilled') {
-                console.log(`Segment ${segment.index} already completed (state: fulfilled), stopping batch at index ${i}`);
                 break;
             }
 
             if (!segment.value || state === 'rejected') {
                 if (state === 'rejected') {
-                    console.log(`Resetting failed segment ${segment.index} for retry`);
                     segment.value!.reset();
-                } else {
-                    console.log(`Preparing unstarted segment ${segment.index} for processing`);
                 }
 
                 segment.value = defer<void>();
                 segmentsToProcess.push(segment);
             }
-        }
-
-        if (segmentsToProcess.length === 0) {
-            console.log(`No segments need processing starting from ${initialSegment.index} - all are pending/fulfilled`);
-        } else {
-            console.log(`Prepared ${segmentsToProcess.length} segments for processing: [${segmentsToProcess.map((s) => s.index).join(', ')}]`);
         }
 
         return segmentsToProcess;
@@ -1030,16 +975,17 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         const segmentsToProcess = this.filterAndPrepareSegments(initialSegment);
 
         if (segmentsToProcess.length === 0) {
-            console.log(`No new segments to process, waiting for existing job to complete segment ${initialSegment.index}`);
-
             return TaskEither.tryCatch(() => initialSegment.value!.promise());
         }
 
         return this.getTranscodeArgs(builder, segmentsToProcess)
             .toTaskEither()
             .chain((options) => this.source.getStreamDirectory(this.type, this.streamIndex, this.quality)
-                .map((outputDir) => ({ options,
-                    outputDir })))
+                .map((outputDir) => ({
+                    options,
+                    outputDir,
+                })))
+            .ioSync(console.log)
             .chain(({ options, outputDir }) => this.executeTranscodeCommand(
                 initialSegment,
                 segmentsToProcess,
@@ -1168,7 +1114,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             lastIndex = progress.segment;
             this.handleSegmentProgress(progress.segment, segments);
             // Note: Could emit metrics here but might be too frequent
-            // this.emitMetrics(); // Uncomment for real-time segment updates
+            // this.emitMetrics(); Uncomment for real-time segment updates
         });
 
         command.on('end', () => {
@@ -1207,14 +1153,12 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         const segment = this.segments.get(segmentIndex);
         const nextSegment = this.segments.get(segmentIndex + 1);
 
-        // Stop early if next segment is already fulfilled
         if (nextSegment && nextSegment.value?.state() === 'fulfilled') {
             // Optionally kill command early for efficiency
             // command.kill('SIGINT');
         }
 
         if (segment) {
-            // Resolve segment or create resolved deferred
             segment.value = segment.value?.resolve() ?? defer<void>().resolve();
             this.metrics.segmentsProcessed++;
         }
@@ -1237,7 +1181,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         lastIndex: number,
         disposeHandler: () => void,
     ): void {
-        // Reject unprocessed segments
         const unprocessedSegments = segments.filter((segment) => segment.index > lastIndex && segment.value?.state() === 'pending');
 
         unprocessedSegments.forEach((segment) => {
@@ -1245,15 +1188,12 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             this.metrics.segmentsFailed++;
         });
 
-        // Update job status
         job.status = TranscodeStatus.ERROR;
         jobRange.status = JobRangeStatus.ERROR;
 
-        // Emit error
         this.emit('transcode:error', { job,
             error: err });
 
-        // Cleanup
         this.off('dispose', disposeHandler);
     }
 
@@ -1323,7 +1263,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     private updateMetricsOnSuccess (segmentCount: number, processingTime: number): void {
         this.metrics.totalJobsCompleted++;
 
-        // Update average processing time
         const totalJobs = this.metrics.totalJobsCompleted;
 
         this.metrics.averageProcessingTime =
@@ -1365,9 +1304,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             clearTimeout(this.timer);
         }
 
-        this.timer = setTimeout(() => {
-            this.dispose();
-        }, this.config.disposeTimeout);
+        this.timer = setTimeout(() => this.dispose(), this.config.disposeTimeout);
     }
 
     /**
