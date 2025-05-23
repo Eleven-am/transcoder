@@ -1179,24 +1179,38 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         lastIndex: number,
         disposeHandler: () => void,
     ): void {
-        const unprocessedSegments = segments.filter((segment) => segment.index > lastIndex && segment.value?.state() === 'pending');
+        try {
+            const unprocessedSegments = segments.filter((segment) => segment.index > lastIndex && segment.value?.state() === 'pending');
 
-        Either
-            .of(unprocessedSegments)
-            .chainItems((segment) => Either.tryCatch(() => segment.value?.reject(new Error(err.message))))
-            .ioSync((items) => this.metrics.segmentsFailed += items.length)
-            .map(() => {
-                job.status = TranscodeStatus.ERROR;
-                jobRange.status = JobRangeStatus.ERROR;
+            let rejectedCount = 0;
 
-                this.emit('transcode:error', {
-                    job,
-                    error: err,
-                });
+            for (const segment of unprocessedSegments) {
+                try {
+                    if (segment.value && segment.value.state() === 'pending') {
+                        segment.value.reject(new Error(err.message));
+                        rejectedCount++;
+                    }
+                } catch (segmentError) {
+                    console.warn(`Failed to reject segment ${segment.index}:`, segmentError);
+                }
+            }
 
-                this.off('dispose', disposeHandler);
-            })
-            .toNullable();
+            this.metrics.segmentsFailed += rejectedCount;
+
+            job.status = TranscodeStatus.ERROR;
+            jobRange.status = JobRangeStatus.ERROR;
+
+            this.emit('transcode:error', {
+                job,
+                error: err,
+            });
+
+            this.off('dispose', disposeHandler);
+        } catch (handlingError) {
+            console.error('Error in handleTranscodeError:', handlingError);
+            job.status = TranscodeStatus.ERROR;
+            jobRange.status = JobRangeStatus.ERROR;
+        }
     }
 
     /**
