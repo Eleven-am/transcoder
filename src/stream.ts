@@ -1255,9 +1255,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             : this.buildVideoTranscodeOptions(segment, originalJob.priority);
 
         return void retryAction
-            .ioSync(() => resolve())
-            .ioErrorSync(({ error }) => reject(error))
-            .toResult();
+            .toPromise()
+            .then(resolve)
+            .catch(reject);
     }
 
     /**
