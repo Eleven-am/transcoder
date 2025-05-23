@@ -1016,6 +1016,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         outputDir: string,
         priority: number,
     ): Promise<void> {
+        console.log(options);
+
         return new Promise((resolve, reject) => {
             const command = this.createFfmpegCommand(options, outputDir);
             const job = this.createTranscodeJob(initialSegment, priority, command);
@@ -1126,6 +1128,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         });
 
         command.on('error', (err: Error) => {
+            console.log(`Transcode error: ${err.message}`);
             this.handleTranscodeError(err, job, jobRange, segments, lastIndex, disposeHandler);
 
             if (this.shouldRetryWithFallback(err, segments[0].index)) {
@@ -1180,7 +1183,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
         Either
             .of(unprocessedSegments)
-            .chainItems((segment) => Either.tryCatch(() => segment.value?.reject(err)))
+            .chainItems((segment) => Either.tryCatch(() => segment.value?.reject(new Error(err.message))))
             .ioSync((items) => this.metrics.segmentsFailed += items.length)
             .map(() => {
                 job.status = TranscodeStatus.ERROR;

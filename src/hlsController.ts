@@ -93,6 +93,7 @@ export class HLSController {
                 void this.#prepareSegments(filePath, clientId, StreamType.AUDIO, masterPlaylist.audio.quality, masterPlaylist.audio.index, 0);
             })
             .map(({ master }) => master)
+            .ioErrorSync(console.log)
             .toPromise();
     }
 
@@ -118,6 +119,7 @@ export class HLSController {
             }))
             .ioSync(() => void this.#prepareSegments(filePath, clientId, type, quality, streamIndex, 0))
             .map(({ stream }) => stream.getPlaylist())
+            .ioErrorSync(console.log)
             .toPromise();
     }
 
@@ -143,6 +145,7 @@ export class HLSController {
                 fileId: stream.getFileId(),
             }))
             .chain(({ stream, priority }) => stream.getSegmentStream(segmentNumber, priority))
+            .ioErrorSync(console.log)
             .toPromise();
     }
 
