@@ -65,15 +65,6 @@ interface JobRange {
     status: JobRangeStatus;
 }
 
-interface FfmpegProgress {
-    segment: number;
-    currentTime: number;
-    targetSize: number;
-    currentBitrate: number;
-    targetBitrate: number;
-    speed: number;
-}
-
 type ArgsBuilder = (segments: string) => Either<FFMPEGOptions>;
 
 interface DetailedVideoQuality extends VideoQuality {
@@ -621,6 +612,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         const key = `${width}x${height}-${codec}-${hwConfigToUse?.method || 'software'}`;
 
         if (!this.cachedHwOptions.has(key)) {
+            console.log(hwConfigToUse);
             const options = this.hwDetector.applyHardwareConfig(
                 hwConfigToUse,
                 width,
@@ -641,14 +633,16 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     private isHardwareAccelerationError (err: Error): boolean {
         const message = err.message.toLowerCase();
 
-        return message.includes('device creation failed') ||
-            message.includes('hardware device setup failed') ||
-            message.includes('nvenc') ||
-            message.includes('vaapi') ||
-            message.includes('qsv') ||
-            message.includes('videotoolbox') ||
-            message.includes('cuda') ||
-            message.includes('hardware acceleration');
+        return [
+            'device creation failed',
+            'hardware device setup failed',
+            'nvenc',
+            'vaapi',
+            'qsv',
+            'videotoolbox',
+            'cuda',
+            'hardware acceleration',
+        ].some((str) => message.includes(str));
     }
 
     /**
@@ -1184,18 +1178,22 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     ): void {
         const unprocessedSegments = segments.filter((segment) => segment.index > lastIndex && segment.value?.state() === 'pending');
 
-        unprocessedSegments.forEach((segment) => {
-            segment.value?.reject(err);
-            this.metrics.segmentsFailed++;
-        });
+        Either
+            .of(unprocessedSegments)
+            .chainItems((segment) => Either.tryCatch(() => segment.value?.reject(err)))
+            .ioSync((items) => this.metrics.segmentsFailed += items.length)
+            .map(() => {
+                job.status = TranscodeStatus.ERROR;
+                jobRange.status = JobRangeStatus.ERROR;
 
-        job.status = TranscodeStatus.ERROR;
-        jobRange.status = JobRangeStatus.ERROR;
+                this.emit('transcode:error', {
+                    job,
+                    error: err,
+                });
 
-        this.emit('transcode:error', { job,
-            error: err });
-
-        this.off('dispose', disposeHandler);
+                this.off('dispose', disposeHandler);
+            })
+            .toNullable();
     }
 
     /**
