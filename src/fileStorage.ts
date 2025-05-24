@@ -92,7 +92,7 @@ export class FileStorage {
      * @param filePath The path to the file.
      * @returns A MediaSource object for the file.
      */
-    getFileStream (filePath: string): TaskEither<NodeJS.ReadableStream> {
+    getFileStream (filePath: string): TaskEither<fs.ReadStream> {
         return TaskEither
             .tryCatch(
                 () => pfs.access(filePath, fs.constants.F_OK),

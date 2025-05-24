@@ -1,3 +1,5 @@
+import { ReadStream } from 'fs';
+
 import { DatabaseConnector } from './databaseConnector';
 import { FfmpegCommand } from './ffmpeg';
 
@@ -222,7 +224,7 @@ export interface TranscodeJob {
 }
 
 export interface SegmentStream {
-    stream: NodeJS.ReadableStream;
+    stream: ReadStream;
     size: number;
 }
 
