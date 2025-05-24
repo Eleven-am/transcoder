@@ -141,6 +141,11 @@ export interface ClientSession {
     videoProfile: VideoQuality;
 }
 
+export interface SegmentStream {
+    stream: NodeJS.ReadableStream;
+    size: number;
+}
+
 export interface StreamMetrics {
     segmentsProcessed: number;
     segmentsFailed: number;
@@ -225,7 +230,7 @@ export declare class HLSController {
      * @param streamIndex The stream index
      * @param segmentNumber The segment number to get
      */
-    getSegmentStream (filePath: string, clientId: string, type: StreamType, quality: string, streamIndex: number, segmentNumber: number): Promise<NodeJS.ReadableStream>;
+    getSegmentStream (filePath: string, clientId: string, type: StreamType, quality: string, streamIndex: number, segmentNumber: number): Promise<SegmentStream>;
 
     /**
      * Extract subtitle from a media source and convert to WebVTT
