@@ -205,7 +205,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	 * @param mediaSource - The media source
 	 * @param streamIndex - The index of the subtitle stream
 	 */
-    static getVTTSubtitle (mediaSource: MediaSource, streamIndex: number): NodeJS.ReadableStream {
+    static getVTTSubtitle (mediaSource: MediaSource, streamIndex: number): Promise<NodeJS.ReadableStream> {
         return this.runFFMPEGCommand(
             [
                 '-map',
@@ -258,15 +258,21 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	 * @param inputPath - The input path to the file to perform the command on
 	 */
     private static runFFMPEGCommand (outputOptions: string[], inputPath: string) {
-        return ffmpeg(inputPath).outputOptions(outputOptions)
-            .pipe();
+        return new Promise<NodeJS.ReadableStream>((resolve, reject) => {
+            const stream = ffmpeg(inputPath)
+                .outputOptions(outputOptions)
+                .on('error', reject)
+                .pipe();
+
+            resolve(stream);
+        });
     }
 
     /**
 	 * Create a screenshot from a media source at a specific timestamp
 	 * @param timestamp - The timestamp of the screenshot to be created
 	 */
-    generateScreenshot (timestamp: number): NodeJS.ReadableStream {
+    generateScreenshot (timestamp: number): Promise<NodeJS.ReadableStream> {
         const command = ffmpeg(this.source.getFilePath());
         const videoProfile = this.buildVideoQuality(this.videoQuality?.value ?? VideoQualityEnum.ORIGINAL);
 
@@ -291,7 +297,13 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
         command.videoFilters(`scale=${videoProfile.width}:${videoProfile.height}`);
 
-        return command.pipe();
+        return new Promise<NodeJS.ReadableStream>((resolve, reject) => {
+            const stream = command
+                .on('error', reject)
+                .pipe();
+
+            resolve(stream);
+        });
     }
 
     /**

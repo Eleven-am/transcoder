@@ -154,10 +154,8 @@ export class HLSController {
      * @returns TaskEither containing the VTT content as string
      */
     getVTTSubtitle (filePath: string, streamIndex: number): Promise<string> {
-        const mediaSource = this.#buildMediaSource(filePath);
-
         return TaskEither
-            .of(Stream.getVTTSubtitle(mediaSource, streamIndex))
+            .tryCatch(() => this.getVTTSubtitleStream(filePath, streamIndex))
             .chain(streamToString)
             .toPromise();
     }
@@ -171,9 +169,7 @@ export class HLSController {
     getVTTSubtitleStream (filePath: string, streamIndex: number): Promise<NodeJS.ReadableStream> {
         const mediaSource = this.#buildMediaSource(filePath);
 
-        return TaskEither
-            .of(Stream.getVTTSubtitle(mediaSource, streamIndex))
-            .toPromise();
+        return Stream.getVTTSubtitle(mediaSource, streamIndex);
     }
 
     /**
@@ -185,7 +181,7 @@ export class HLSController {
      */
     generateScreenshot (filePath: string, quality: string, streamIndex: number, time: number): Promise<NodeJS.ReadableStream> {
         return this.#getOrCreateStream(filePath, StreamType.VIDEO, quality, streamIndex)
-            .map((stream) => stream.generateScreenshot(time))
+            .fromPromise((stream) => stream.generateScreenshot(time))
             .toPromise();
     }
 
