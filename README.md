@@ -10,7 +10,7 @@ The library takes video files and converts them into segmented streams with mult
 
 Beyond basic transcoding, it implements intelligent client tracking and priority-based processing. When multiple users watch the same content, it optimizes transcoding jobs based on user behavior—prioritizing segments for active viewers while de-prioritizing background processing. This ensures smooth playback even under high load.
 
-The system automatically detects and configures hardware acceleration (NVIDIA CUDA, Apple VideoToolbox, Intel QuickSync, or Linux VAAPI) to dramatically reduce transcoding times and server resource usage compared to software-only solutions.
+The system automatically detects and configures hardware acceleration (NVIDIA CUDA, AMD AMF, Apple VideoToolbox, Intel QuickSync, or Linux VAAPI) to dramatically reduce transcoding times and server resource usage compared to software-only solutions.
 
 Advanced resource management monitors CPU, memory, and disk I/O to dynamically adjust concurrent transcoding jobs. This prevents system overload while maximizing throughput, making it production-ready for serving multiple concurrent streams.
 
@@ -51,7 +51,11 @@ import path from 'path';
 const hlsController = new HLSController({
     cacheDirectory: './cache',
     hwAccel: true, // Enable hardware acceleration
-    maxSegmentBatchSize: 50
+    maxSegmentBatchSize: 50,
+    config: {
+        enableHardwareAccelFallback: true,
+        metricsInterval: 30000
+    }
 });
 
 // Initialize hardware acceleration detection
@@ -89,6 +93,23 @@ new HLSController(options: HLSManagerOptions)
 - `maxSegmentBatchSize?` (number): Maximum segments to process in one batch (default: 100)
 - `videoQualities?` (VideoQualityEnum[]): Available video quality levels
 - `audioQualities?` (AudioQualityEnum[]): Available audio quality levels
+- `config?` (Partial<StreamConfig>): Advanced stream configuration options
+
+#### Stream Configuration
+
+The `config` option accepts a `StreamConfig` object with the following properties:
+
+```typescript
+interface StreamConfig {
+    disposeTimeout: number;           // Time before disposing unused streams (default: 30min)
+    maxEncoderDistance: number;       // Max distance for encoder optimization (default: 60)
+    segmentTimeout: number;           // Timeout for segment processing (default: 60s)
+    enableHardwareAccelFallback: boolean;  // Enable fallback to software (default: true)
+    retryFailedSegments: boolean;     // Retry failed segments (default: true)
+    maxRetries: number;               // Maximum retry attempts (default: 3)
+    metricsInterval: number;          // Metrics emission interval in ms (default: 30s)
+}
+```
 
 #### Methods
 
@@ -101,20 +122,84 @@ Generate the master HLS playlist for a media file.
 ##### `getIndexPlaylist(filePath: string, clientId: string, type: StreamType, quality: string, streamIndex: number): Promise<string>`
 Get the index playlist for a specific stream quality.
 
-##### `getSegmentStream(filePath: string, clientId: string, type: StreamType, quality: string, streamIndex: number, segmentNumber: number): Promise<NodeJS.ReadableStream>`
-Get a specific segment stream for playback.
+##### `getSegmentStream(filePath: string, clientId: string, type: StreamType, quality: string, streamIndex: number, segmentNumber: number): Promise<SegmentStream>`
+Get a specific segment stream for playback. Returns a `SegmentStream` object containing the stream and size information.
+
+```typescript
+interface SegmentStream {
+    stream: ReadStream;  // The segment file stream
+    size: number;        // Size of the segment in bytes
+}
+```
 
 ##### `generateScreenshot(filePath: string, quality: string, streamIndex: number, time: number): Promise<NodeJS.ReadableStream>`
 Generate a screenshot at a specific timestamp.
 
-##### `getVTTSubtitle(filePath: string, streamIndex: number): Promise<NodeJS.ReadableStream>`
-Extract and convert subtitles to WebVTT format.
+##### `getVTTSubtitle(filePath: string, streamIndex: number): Promise<string>`
+Extract and convert subtitles to WebVTT format as a string.
+
+##### `getVTTSubtitleStream(filePath: string, streamIndex: number): Promise<NodeJS.ReadableStream>`
+Extract and convert subtitles to WebVTT format as a stream.
 
 ##### `getConvertibleSubtitles(filePath: string): Promise<SubtitleInfo[]>`
 Get list of subtitle streams that can be converted to WebVTT.
 
+##### `createMetadata(filePath: string): Promise<void>`
+Pre-generate and cache metadata for a media file. Useful for preprocessing files before streaming.
+
 ##### `onSessionChange(callback: (session: ClientSession) => void): void`
 Listen for client session changes (quality changes, playback status).
+
+##### `onStreamMetrics(callback: (event: StreamMetricsEvent) => void): void`
+Listen for comprehensive stream metrics including performance data, hardware acceleration status, and transcoding progress.
+
+## Stream Metrics
+
+The library provides comprehensive metrics through the `onStreamMetrics` callback:
+
+```typescript
+interface StreamMetricsEvent {
+    streamId: string;
+    fileId: string;
+    type: StreamType;
+    quality: string;
+    streamIndex: number;
+    
+    // Core metrics
+    metrics: {
+        segmentsProcessed: number;
+        segmentsFailed: number;
+        averageProcessingTime: number;
+        hardwareAccelUsed: boolean;
+        fallbacksToSoftware: number;
+        totalJobsStarted: number;
+        totalJobsCompleted: number;
+    };
+    
+    // Hardware acceleration status
+    isUsingHardwareAcceleration: boolean;
+    currentAccelerationMethod: string;
+    originalAccelerationMethod: string | null;
+    hasFallenBackToSoftware: boolean;
+    
+    // Progress tracking
+    totalSegments: number;
+    segmentsCompleted: number;
+    segmentsPending: number;
+    segmentsFailed: number;
+    segmentsUnstarted: number;
+    
+    // Performance data
+    currentJobsActive: number;
+    averageSegmentDuration: number;
+    estimatedTimeRemaining: number | null;
+    
+    // Timing information
+    streamCreatedAt: number;
+    lastActivityAt: number;
+    metricsGeneratedAt: number;
+}
+```
 
 ## Advanced Usage
 
@@ -150,11 +235,12 @@ const hlsController = new HLSController({
 });
 ```
 
-### Session Monitoring
+### Session and Metrics Monitoring
 
-Track client playback sessions and transcoding status:
+Track client playback sessions and comprehensive stream metrics:
 
 ```typescript
+// Monitor client sessions
 hlsController.onSessionChange((session) => {
   console.log(`Client ${session.clientId}:`);
   console.log(`- File: ${session.filePath}`);
@@ -162,6 +248,58 @@ hlsController.onSessionChange((session) => {
   console.log(`- Video: ${session.videoProfile.value} (${session.videoProfile.height}p)`);
   console.log(`- Audio: ${session.audioProfile.value}`);
 });
+
+// Monitor stream performance and progress
+hlsController.onStreamMetrics((event) => {
+  console.log(`Stream ${event.streamId}:`);
+  console.log(`- Progress: ${event.segmentsCompleted}/${event.totalSegments} segments`);
+  console.log(`- Hardware Accel: ${event.isUsingHardwareAcceleration ? event.currentAccelerationMethod : 'Software'}`);
+  console.log(`- Average Processing Time: ${event.metrics.averageProcessingTime}ms`);
+  console.log(`- Failed Segments: ${event.segmentsFailed}`);
+  
+  if (event.estimatedTimeRemaining) {
+    console.log(`- ETA: ${Math.round(event.estimatedTimeRemaining / 1000)}s`);
+  }
+  
+  if (event.hasFallenBackToSoftware) {
+    console.log(`- Fallback: ${event.originalAccelerationMethod} → software`);
+  }
+});
+```
+
+### Advanced Configuration
+
+```typescript
+const hlsController = new HLSController({
+  cacheDirectory: './cache',
+  hwAccel: true,
+  maxSegmentBatchSize: 100,
+  config: {
+    disposeTimeout: 45 * 60 * 1000,      // 45 minutes
+    enableHardwareAccelFallback: true,    // Enable fallback to software
+    retryFailedSegments: true,            // Retry failed segments
+    maxRetries: 5,                        // Max retry attempts
+    metricsInterval: 15000,               // Emit metrics every 15 seconds
+    segmentTimeout: 120000,               // 2 minute segment timeout
+    maxEncoderDistance: 30                // Optimize for closer segments
+  }
+});
+```
+
+### Preprocessing Media Files
+
+Pre-generate metadata for faster initial playback:
+
+```typescript
+// Preprocess files during upload or import
+async function preprocessMedia(filePath: string) {
+  try {
+    await hlsController.createMetadata(filePath);
+    console.log('Metadata created and cached');
+  } catch (error) {
+    console.error('Failed to create metadata:', error);
+  }
+}
 ```
 
 ### Express.js Integration
@@ -173,7 +311,11 @@ import { HLSController, StreamType } from '@eleven-am/transcoder';
 const app = express();
 const hlsController = new HLSController({
   cacheDirectory: './cache',
-  hwAccel: true
+  hwAccel: true,
+  config: {
+    enableHardwareAccelFallback: true,
+    metricsInterval: 30000
+  }
 });
 
 await hlsController.initialize();
@@ -186,7 +328,10 @@ app.get('/video/:fileId/playlist.m3u8', async (req, res) => {
   
   try {
     const playlist = await hlsController.getMasterPlaylist(filePath, clientId);
-    res.set('Content-Type', 'application/vnd.apple.mpegurl');
+    res.set({
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Cache-Control': 'no-cache'
+    });
     res.send(playlist);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -210,7 +355,10 @@ app.get('/video/:fileId/:type/:index/:quality/playlist.m3u8', async (req, res) =
       parseInt(index)
     );
     
-    res.set('Content-Type', 'application/vnd.apple.mpegurl');
+    res.set({
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Cache-Control': 'no-cache'
+    });
     res.send(playlist);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -226,7 +374,7 @@ app.get('/video/:fileId/:type/:index/:quality/segment-:segment.ts', async (req, 
   const streamType = type === 'video' ? StreamType.VIDEO : StreamType.AUDIO;
   
   try {
-    const stream = await hlsController.getSegmentStream(
+    const segmentData = await hlsController.getSegmentStream(
       filePath,
       clientId,
       streamType,
@@ -235,25 +383,55 @@ app.get('/video/:fileId/:type/:index/:quality/segment-:segment.ts', async (req, 
       parseInt(segment)
     );
     
-    res.set('Content-Type', 'video/mp2t');
-    stream.pipe(res);
+    res.set({
+      'Content-Type': 'video/mp2t',
+      'Content-Length': segmentData.size.toString(),
+      'Cache-Control': 'public, max-age=31536000'
+    });
+    
+    segmentData.stream.pipe(res);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(404).json({ error: 'Segment not found' });
   }
+});
+
+// Stream metrics endpoint
+app.get('/video/:fileId/metrics', (req, res) => {
+  const { fileId } = req.params;
+  
+  // Set up Server-Sent Events for real-time metrics
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+  
+  const metricsHandler = (event) => {
+    if (event.fileId === fileId) {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    }
+  };
+  
+  hlsController.onStreamMetrics(metricsHandler);
+  
+  req.on('close', () => {
+    // Clean up listener when client disconnects
+    hlsController.removeListener('stream:metrics', metricsHandler);
+  });
 });
 ```
 
 ## Quality Levels
 
 ### Video Qualities
-- `240p`: 240px height, ~400kbps
-- `360p`: 360px height, ~800kbps
-- `480p`: 480px height, ~1.2Mbps
-- `720p`: 720px height, ~2.4Mbps
-- `1080p`: 1080px height, ~4.8Mbps
-- `1440p`: 1440px height, ~9.6Mbps
-- `4k`: 2160px height, ~16Mbps
-- `8k`: 4320px height, ~28Mbps
+- `240p`: 240px height, ~400kbps average, ~700kbps max
+- `360p`: 360px height, ~800kbps average, ~1.4Mbps max
+- `480p`: 480px height, ~1.2Mbps average, ~2.1Mbps max
+- `720p`: 720px height, ~2.4Mbps average, ~4Mbps max
+- `1080p`: 1080px height, ~4.8Mbps average, ~8Mbps max
+- `1440p`: 1440px height, ~9.6Mbps average, ~12Mbps max
+- `4k`: 2160px height, ~16Mbps average, ~28Mbps max
+- `8k`: 4320px height, ~28Mbps average, ~40Mbps max
 - `original`: No transcoding, original quality
 
 ### Audio Qualities
@@ -262,22 +440,64 @@ app.get('/video/:fileId/:type/:index/:quality/segment-:segment.ts', async (req, 
 
 ## Hardware Acceleration
 
-The library automatically detects and configures hardware acceleration:
+The library automatically detects and configures hardware acceleration with platform-specific optimization:
 
-- **NVIDIA CUDA**: Requires NVIDIA GPU with NVENC/NVDEC support
-- **Apple VideoToolbox**: Available on macOS with Apple Silicon or Intel
-- **Intel QuickSync**: Available on Intel CPUs with integrated graphics
-- **VAAPI**: Available on Linux with Intel/AMD GPUs
+### Supported Hardware Acceleration Methods
 
-Hardware acceleration significantly improves transcoding performance and reduces CPU usage.
+- **NVIDIA CUDA**: NVIDIA GPUs with NVENC/NVDEC support (Windows, Linux)
+- **AMD AMF**: AMD GPUs with Advanced Media Framework (Windows)
+- **Apple VideoToolbox**: macOS with Apple Silicon or Intel processors
+- **Intel QuickSync (QSV)**: Intel CPUs with integrated graphics (Windows, Linux)
+- **VAAPI**: Intel and AMD GPUs on Linux systems
 
-## Performance Considerations
+### Detection Priority by Platform
 
-- **Segment Caching**: Transcoded segments are cached to disk for reuse
+**Windows:**
+1. NVIDIA CUDA (if NVIDIA GPU present)
+2. AMD AMF (if AMD GPU present)
+3. Intel QuickSync (if Intel integrated graphics)
+4. Software fallback
+
+**macOS:**
+1. Apple VideoToolbox (native acceleration)
+2. NVIDIA CUDA (if supported NVIDIA GPU)
+3. Software fallback
+
+**Linux:**
+1. VAAPI (Intel/AMD GPUs)
+2. NVIDIA CUDA (if NVIDIA GPU present)
+3. Intel QuickSync
+4. Software fallback
+
+### Hardware Acceleration Features
+
+- **Automatic Detection**: Comprehensive testing of each acceleration method
+- **Intelligent Fallback**: Automatic fallback to software encoding if hardware fails
+- **Error Recovery**: Retry failed segments with different acceleration methods
+- **Performance Optimization**: Dynamic adjustment based on hardware capabilities
+- **Codec-Specific Optimization**: Optimal decoder selection (especially for CUDA)
+
+Hardware acceleration significantly improves transcoding performance and reduces CPU usage, often providing 5-10x speed improvements over software-only encoding.
+
+## Performance Features
+
+### Intelligent Client Behavior Analysis
+- **First-time viewers**: Higher priority for initial segments
+- **Sequential playback**: Optimized for continuous viewing
+- **Seeking behavior**: Prioritized transcoding for scrubbing
+
+### Dynamic Resource Management
+- **Segment Caching**: Transcoded segments cached to disk for reuse
 - **Batch Processing**: Multiple segments processed together for efficiency
-- **Priority System**: Client behavior affects transcoding priority (seeking vs sequential)
-- **System Load Balancing**: Automatically adjusts concurrent jobs based on system load
+- **Priority Queuing**: Client behavior affects transcoding priority
+- **System Load Balancing**: Automatically adjusts concurrent jobs based on CPU, memory, and I/O
 - **Resource Cleanup**: Automatic cleanup of unused streams and old cache files
+
+### Adaptive Processing
+- **Dynamic Batch Sizing**: Larger batches with hardware acceleration
+- **Load-based Throttling**: Reduces concurrent jobs under high system load
+- **Memory Pressure Handling**: Intelligent memory usage monitoring
+- **Network-aware Processing**: Adjusts based on client connection patterns
 
 ## Error Handling
 
@@ -290,11 +510,73 @@ try {
 } catch (error) {
     console.error('Error generating playlist:', error.message);
 }
+
+// Handle hardware acceleration fallbacks
+hlsController.onStreamMetrics((event) => {
+    if (event.hasFallenBackToSoftware) {
+        console.warn(`Hardware acceleration failed, using software: ${event.originalAccelerationMethod} → software`);
+    }
+});
+```
+
+## Types Reference
+
+### Core Enums
+
+```typescript
+enum StreamType {
+    VIDEO = 'v',
+    AUDIO = 'a'
+}
+
+enum TranscodeType {
+    DIRECT_PLAY = 'DIRECT_PLAY',       // No transcoding needed
+    DIRECT_STREAM = 'DIRECT_STREAM',   // Container remuxing only
+    TRANSCODING = 'TRANSCODING'        // Full transcoding required
+}
+
+enum VideoQualityEnum {
+    P240 = '240p',
+    P360 = '360p',
+    P480 = '480p',
+    P720 = '720p',
+    P1080 = '1080p',
+    P1440 = '1440p',
+    P4K = '4k',
+    P8K = '8k',
+    ORIGINAL = 'original'
+}
+
+enum AudioQualityEnum {
+    AAC = 'aac',
+    ORIGINAL = 'original'
+}
+```
+
+### Key Interfaces
+
+```typescript
+interface ClientSession {
+    filePath: string;
+    clientId: string;
+    audioIndex: number;
+    videoIndex: number;
+    status: TranscodeType;
+    audioProfile: AudioQuality;
+    videoProfile: VideoQuality;
+}
+
+interface SegmentStream {
+    stream: ReadStream;  // File stream for the segment
+    size: number;        // Size in bytes
+}
 ```
 
 ## License
 
-ISC
+GPL-3.0
+
+Copyright (C) 2025 Roy OSSAI
 
 ## Contributing
 
