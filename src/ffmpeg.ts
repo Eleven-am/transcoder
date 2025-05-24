@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { Readable } from 'stream';
 
 import { ExtendedEventEmitter } from './utils';
 
@@ -143,7 +144,7 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
      * Pipe the FFmpeg output to a stream rather than a file
      * @returns The stdout stream from the FFmpeg process
      */
-    pipe (): NodeJS.ReadableStream {
+    pipe (): Readable {
         if (this.isRunning) {
             throw new Error('FFmpeg process is already running');
         }

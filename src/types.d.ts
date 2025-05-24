@@ -1,4 +1,5 @@
 import { ReadStream } from 'fs';
+import { Readable } from 'stream';
 
 export enum StreamType {
     VIDEO = 'v',
@@ -248,7 +249,7 @@ export declare class HLSController {
      * @param streamIndex The subtitle stream index to extract
      * @returns TaskEither containing the VTT content as stream
      */
-    getVTTSubtitleStream (filePath: string, streamIndex: number): Promise<NodeJS.ReadableStream>;
+    getVTTSubtitleStream (filePath: string, streamIndex: number): Promise<Readable>;
 
     /**
      * Create a screenshot from a media source at a specific timestamp
@@ -257,7 +258,7 @@ export declare class HLSController {
      * @param streamIndex The stream index to take the screenshot from
      * @param time The time to take the screenshot at
      */
-    generateScreenshot (filePath: string, quality: string, streamIndex: number, time: number): Promise<NodeJS.ReadableStream>;
+    generateScreenshot (filePath: string, quality: string, streamIndex: number, time: number): Promise<Readable>;
 
     /**
      * Get all convertible subtitle streams from media metadata

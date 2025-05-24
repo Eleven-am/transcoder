@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { Readable } from 'stream';
 
 import { createBadRequestError, createNotFoundError, Deferred, Either, Result, sortBy, TaskEither } from '@eleven-am/fp';
 
@@ -258,7 +259,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	 * @param inputPath - The input path to the file to perform the command on
 	 */
     private static runFFMPEGCommand (outputOptions: string[], inputPath: string) {
-        return new Promise<NodeJS.ReadableStream>((resolve, reject) => {
+        return new Promise<Readable>((resolve, reject) => {
             const stream = ffmpeg(inputPath)
                 .outputOptions(outputOptions)
                 .on('error', reject)
