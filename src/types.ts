@@ -30,6 +30,7 @@ export enum HardwareAccelerationMethod {
     VIDEOTOOLBOX = 'videotoolbox',
     QSV = 'qsv',
     VAAPI = 'vaapi',
+    AMF = 'amf',
 }
 
 export interface FFMPEGOptions {

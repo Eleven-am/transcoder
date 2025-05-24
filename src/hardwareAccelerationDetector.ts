@@ -10,9 +10,9 @@ const execAsync = promisify(exec);
 
 export class HardwareAccelerationDetector {
     /**
-     * Detect the best available hardware acceleration method
-     * @returns A TaskEither with the hardware acceleration configuration
-     */
+	 * Detect the best available hardware acceleration method
+	 * @returns A TaskEither with the hardware acceleration configuration
+	 */
     detectHardwareAcceleration (): TaskEither<HardwareAccelerationConfig> {
         const platform = os.platform();
 
@@ -36,6 +36,7 @@ export class HardwareAccelerationDetector {
                 {
                     predicate: () => platform === 'win32',
                     run: () => this.detectCuda()
+                        .orElse(() => this.detectAmf())
                         .orElse(() => this.detectQsv()),
                 },
             ])
@@ -43,13 +44,13 @@ export class HardwareAccelerationDetector {
     }
 
     /**
-     * Apply the hardware acceleration configuration to FFmpeg options
-     * @param hwConfig Hardware acceleration configuration
-     * @param width Target width
-     * @param height Target height
-     * @param codec Target codec (h264 or h265)
-     * @returns Object with inputOptions, outputOptions, and videoFilters
-     */
+	 * Apply the hardware acceleration configuration to FFmpeg options
+	 * @param hwConfig Hardware acceleration configuration
+	 * @param width Target width
+	 * @param height Target height
+	 * @param codec Target codec (h264 or h265)
+	 * @returns Object with inputOptions, outputOptions, and videoFilters
+	 */
     applyHardwareConfig (hwConfig: HardwareAccelerationConfig | null, width: number, height: number, codec: CodecType = 'h264'): FFMPEGOptions {
         hwConfig = hwConfig || this.getSoftwareConfig();
         const outputOptions = hwConfig.outputOptions[codec] || hwConfig.outputOptions['h264'];
@@ -79,9 +80,9 @@ export class HardwareAccelerationDetector {
     }
 
     /**
-     * Check if FFmpeg supports hardware acceleration with comprehensive testing
-     * @returns A TaskEither with a boolean indicating if hardware acceleration is supported
-     */
+	 * Check if FFmpeg supports hardware acceleration with comprehensive testing
+	 * @returns A TaskEither with a boolean indicating if hardware acceleration is supported
+	 */
     private checkFfmpegHardwareAccelerationSupport (): TaskEither<boolean> {
         const checkFfmpegInstallTask = TaskEither
             .tryCatch(
@@ -119,10 +120,10 @@ export class HardwareAccelerationDetector {
                 const output = result.stdout.toLowerCase();
 
                 return output.includes('hardware acceleration') ||
-                    output.includes('hwaccels') ||
-                    (output.includes('cuda') || output.includes('vaapi') ||
-                        output.includes('videotoolbox') || output.includes('qsv') ||
-                        output.includes('dxva2') || output.includes('d3d11va'));
+					output.includes('hwaccels') ||
+					(output.includes('cuda') || output.includes('vaapi') ||
+						output.includes('videotoolbox') || output.includes('qsv') ||
+						output.includes('dxva2') || output.includes('d3d11va'));
             })
             .orElse(() => TaskEither.of(false));
 
@@ -135,11 +136,11 @@ export class HardwareAccelerationDetector {
                 const output = result.stdout.toLowerCase();
 
                 return output.includes('nvenc') ||
-                    output.includes('vaapi') ||
-                    output.includes('videotoolbox') ||
-                    output.includes('qsv') ||
-                    output.includes('amf') ||
-                    output.includes('v4l2');
+					output.includes('vaapi') ||
+					output.includes('videotoolbox') ||
+					output.includes('qsv') ||
+					output.includes('amf') ||
+					output.includes('v4l2');
             })
             .orElse(() => TaskEither.of(false));
 
@@ -152,10 +153,10 @@ export class HardwareAccelerationDetector {
                 const output = (result.stderr || '') + (result.stdout || '');
 
                 const hasCriticalErrors = output.includes('Unknown encoder') ||
-                    output.includes('Encoder not found') ||
-                    output.includes('No such file or directory') ||
-                    output.includes('Permission denied') ||
-                    output.includes('command not found');
+					output.includes('Encoder not found') ||
+					output.includes('No such file or directory') ||
+					output.includes('Permission denied') ||
+					output.includes('command not found');
 
                 return !hasCriticalErrors;
             })
@@ -170,9 +171,9 @@ export class HardwareAccelerationDetector {
                 const output = result.stdout.toLowerCase();
 
                 return output.includes('libavcodec') &&
-                    output.includes('libavformat') &&
-                    output.includes('libavutil') &&
-                    (output.includes('libx264') || output.includes('openh264'));
+					output.includes('libavformat') &&
+					output.includes('libavutil') &&
+					(output.includes('libx264') || output.includes('openh264'));
             })
             .orElse(() => TaskEither.of(false));
 
@@ -185,14 +186,14 @@ export class HardwareAccelerationDetector {
                 const output = result.stdout.toLowerCase();
 
                 return output.includes('--enable-cuda') ||
-                    output.includes('--enable-vaapi') ||
-                    output.includes('--enable-videotoolbox') ||
-                    output.includes('--enable-qsv') ||
-                    output.includes('--enable-nvenc') ||
-                    output.includes('--enable-amf') ||
-                    (!output.includes('--disable-cuda') &&
-                        !output.includes('--disable-vaapi') &&
-                        !output.includes('--disable-videotoolbox'));
+					output.includes('--enable-vaapi') ||
+					output.includes('--enable-videotoolbox') ||
+					output.includes('--enable-qsv') ||
+					output.includes('--enable-nvenc') ||
+					output.includes('--enable-amf') ||
+					(!output.includes('--disable-cuda') &&
+						!output.includes('--disable-vaapi') &&
+						!output.includes('--disable-videotoolbox'));
             })
             .orElse(() => TaskEither.of(true));
 
@@ -224,9 +225,9 @@ export class HardwareAccelerationDetector {
     }
 
     /**
-     * Detect CUDA (NVIDIA) hardware acceleration support with comprehensive testing
-     * @returns A TaskEither with the CUDA hardware acceleration configuration
-     */
+	 * Detect CUDA (NVIDIA) hardware acceleration support with comprehensive testing
+	 * @returns A TaskEither with the CUDA hardware acceleration configuration
+	 */
     private detectCuda (): TaskEither<HardwareAccelerationConfig> {
         const checkCudaSupportTask = TaskEither
             .tryCatch(
@@ -284,10 +285,10 @@ export class HardwareAccelerationDetector {
                 const output = (result.stderr || '') + (result.stdout || '');
 
                 return !output.includes('Device creation failed') &&
-                    !output.includes('No device available') &&
-                    !output.includes('CUDA not available') &&
-                    !output.includes('Cannot load nvcuda.dll') &&
-                    !output.includes('Cannot load libcuda.so');
+					!output.includes('No device available') &&
+					!output.includes('CUDA not available') &&
+					!output.includes('Cannot load nvcuda.dll') &&
+					!output.includes('Cannot load libcuda.so');
             })
             .orElse(() => TaskEither.of(false));
 
@@ -299,24 +300,24 @@ export class HardwareAccelerationDetector {
             .map((result) => {
                 const output = (result.stderr || '') + (result.stdout || '');
                 const hasDeviceError = output.includes('Device creation failed') ||
-                    output.includes('No device available') ||
-                    output.includes('CUDA') && (
-                        output.includes('not available') ||
-                        output.includes('not supported') ||
-                        output.includes('failed') ||
-                        output.includes('error')
-                    ) ||
-                    output.includes('NVENC') && (
-                        output.includes('not available') ||
-                        output.includes('not supported') ||
-                        output.includes('failed') ||
-                        output.includes('error')
-                    ) ||
-                    output.includes('Hardware device setup failed') ||
-                    output.includes('Cannot load nvcuda') ||
-                    output.includes('Cannot load libcuda') ||
-                    output.includes('No NVENC capable devices found') ||
-                    output.includes('Driver does not support NVENC');
+					output.includes('No device available') ||
+					output.includes('CUDA') && (
+					    output.includes('not available') ||
+						output.includes('not supported') ||
+						output.includes('failed') ||
+						output.includes('error')
+					) ||
+					output.includes('NVENC') && (
+					    output.includes('not available') ||
+						output.includes('not supported') ||
+						output.includes('failed') ||
+						output.includes('error')
+					) ||
+					output.includes('Hardware device setup failed') ||
+					output.includes('Cannot load nvcuda') ||
+					output.includes('Cannot load libcuda') ||
+					output.includes('No NVENC capable devices found') ||
+					output.includes('Driver does not support NVENC');
 
                 return !hasDeviceError;
             })
@@ -331,8 +332,8 @@ export class HardwareAccelerationDetector {
                 const output = (result.stderr || '') + (result.stdout || '');
 
                 const hasCriticalError = output.includes('Unknown encoder') ||
-                    output.includes('No NVENC capable devices') ||
-                    output.includes('Driver does not support NVENC');
+					output.includes('No NVENC capable devices') ||
+					output.includes('Driver does not support NVENC');
 
                 return !hasCriticalError;
             })
@@ -374,16 +375,16 @@ export class HardwareAccelerationDetector {
                     nvencCapabilities,
                     nvidiaDriver,
                 }) => cudaSupport && nvidiaGpu && cuvidDecoders && nvencEncoders &&
-                    cudaInit && (nvencDevice || nvencCapabilities) && nvidiaDriver,
+					cudaInit && (nvencDevice || nvencCapabilities) && nvidiaDriver,
                 () => createInternalError('CUDA/NVENC acceleration not available or device not functional'),
             )
             .map(() => this.getCudaConfig());
     }
 
     /**
-     * Detect VAAPI (Intel/AMD on Linux) hardware acceleration support with comprehensive testing
-     * @returns A TaskEither with the VAAPI hardware acceleration configuration
-     */
+	 * Detect VAAPI (Intel/AMD on Linux) hardware acceleration support with comprehensive testing
+	 * @returns A TaskEither with the VAAPI hardware acceleration configuration
+	 */
     private detectVAAPI (): TaskEither<HardwareAccelerationConfig> {
         const checkVaapiSupportTask = TaskEither
             .tryCatch(
@@ -437,16 +438,16 @@ export class HardwareAccelerationDetector {
                 const output = (result.stderr || '') + (result.stdout || '');
 
                 const hasDeviceError = output.includes('Device creation failed') ||
-                    output.includes('No device available') ||
-                    output.includes('VAAPI') && (
-                        output.includes('not available') ||
-                        output.includes('not supported') ||
-                        output.includes('failed') ||
-                        output.includes('error')
-                    ) ||
-                    output.includes('Hardware device setup failed') ||
-                    output.includes('Cannot load libva') ||
-                    output.includes('vaInitialize failed');
+					output.includes('No device available') ||
+					output.includes('VAAPI') && (
+					    output.includes('not available') ||
+						output.includes('not supported') ||
+						output.includes('failed') ||
+						output.includes('error')
+					) ||
+					output.includes('Hardware device setup failed') ||
+					output.includes('Cannot load libva') ||
+					output.includes('vaInitialize failed');
 
                 return !hasDeviceError;
             })
@@ -462,8 +463,8 @@ export class HardwareAccelerationDetector {
 
 
                 return !output.includes('Device creation failed') &&
-                    !output.includes('No device available') &&
-                    !output.includes('vaInitialize failed');
+					!output.includes('No device available') &&
+					!output.includes('vaInitialize failed');
             })
             .orElse(() => TaskEither.of(false));
 
@@ -487,17 +488,17 @@ export class HardwareAccelerationDetector {
                     vaapiDevice,
                     vaapiInit,
                 }) => vaapiSupport && vaapiEncoders && vaapiDecoders &&
-                    Boolean(renderDevice) && vainfoAvailable &&
-                    (vaapiDevice || vaapiInit),
+					Boolean(renderDevice) && vainfoAvailable &&
+					(vaapiDevice || vaapiInit),
                 () => createInternalError('VAAPI acceleration not available or device not functional'),
             )
             .map(({ renderDevice }) => this.getVAAPIConfig(renderDevice!));
     }
 
     /**
-     * Detect VideoToolbox (macOS) hardware acceleration support with device testing
-     * @returns A TaskEither with the VideoToolbox hardware acceleration configuration
-     */
+	 * Detect VideoToolbox (macOS) hardware acceleration support with device testing
+	 * @returns A TaskEither with the VideoToolbox hardware acceleration configuration
+	 */
     private detectVideoToolbox (): TaskEither<HardwareAccelerationConfig> {
         if (os.platform() !== 'darwin') {
             return TaskEither.error(createBadRequestError('VideoToolbox is only available on macOS'));
@@ -528,15 +529,15 @@ export class HardwareAccelerationDetector {
 
                 const hasDeviceError = output.includes('VideoToolbox') && (
                     output.includes('Error') ||
-                    output.includes('Failed') ||
-                    output.includes('not available') ||
-                    output.includes('not supported') ||
-                    output.includes('Invalid argument') ||
-                    output.includes('Operation not supported')
+					output.includes('Failed') ||
+					output.includes('not available') ||
+					output.includes('not supported') ||
+					output.includes('Invalid argument') ||
+					output.includes('Operation not supported')
                 );
 
                 const hasGenericHardwareError = output.includes('Hardware acceleration') &&
-                    output.includes('not available');
+					output.includes('not available');
 
                 return !hasDeviceError && !hasGenericHardwareError;
             })
@@ -551,7 +552,7 @@ export class HardwareAccelerationDetector {
                 const output = (result.stderr || '') + (result.stdout || '');
 
                 return !output.includes('Unknown input format') ||
-                    !output.includes('VideoToolbox not available');
+					!output.includes('VideoToolbox not available');
             })
             .orElse(() => TaskEither.of(true));
 
@@ -575,9 +576,63 @@ export class HardwareAccelerationDetector {
     }
 
     /**
-     * Detect Intel QuickSync Video support with device testing
-     * @returns A TaskEither with the QSV hardware acceleration configuration
-     */
+	 * Detect AMF (AMD) hardware acceleration support with device testing
+	 * @returns A TaskEither with the AMF hardware acceleration configuration
+	 */
+    private detectAmf (): TaskEither<HardwareAccelerationConfig> {
+        const checkAmfEncodersTask = TaskEither
+            .tryCatch(
+                () => execAsync('ffmpeg -hide_banner -encoders'),
+                'Failed to check AMF encoders',
+            )
+            .map((result) => result.stdout.includes('h264_amf') || result.stdout.includes('hevc_amf'));
+
+        const checkAmfHwaccelTask = TaskEither
+            .tryCatch(
+                () => execAsync('ffmpeg -hide_banner -hwaccels'),
+                'Failed to check AMF hwaccel',
+            )
+            .map((result) => result.stdout.toLowerCase().includes('amf'));
+
+        const testAmfDeviceTask = TaskEither
+            .tryCatch(
+                () => execAsync('ffmpeg -hide_banner -f lavfi -i testsrc2=duration=1:size=320x240:rate=1 -t 1 -f null -c:v h264_amf - 2>&1'),
+                'Failed to test AMF device',
+            )
+            .map((result) => {
+                const output = (result.stderr || '') + (result.stdout || '');
+                const errorKeywords = [
+                    'Device creation failed',
+                    'No device available',
+                    'AMF',
+                    'not available',
+                    'not supported',
+                    'failed',
+                    'error',
+                ];
+
+
+                return !errorKeywords.some((keyword) => output.includes(keyword));
+            })
+            .orElse(() => TaskEither.of(false));
+
+        return TaskEither
+            .fromBind({
+                amfEncoders: checkAmfEncodersTask,
+                amfHwaccel: checkAmfHwaccelTask,
+                amfDevice: testAmfDeviceTask,
+            })
+            .filter(
+                ({ amfEncoders, amfHwaccel, amfDevice }) => amfEncoders && amfHwaccel && amfDevice,
+                () => createInternalError('AMF acceleration not available or device not functional'),
+            )
+            .map(() => this.getAmfConfig());
+    }
+
+    /**
+	 * Detect Intel QuickSync Video support with device testing
+	 * @returns A TaskEither with the QSV hardware acceleration configuration
+	 */
     private detectQsv (): TaskEither<HardwareAccelerationConfig> {
         const checkQsvEncodersTask = TaskEither
             .tryCatch(
@@ -602,7 +657,7 @@ export class HardwareAccelerationDetector {
                 const output = (result.stderr || '') + (result.stdout || '');
 
                 return !output.includes('Device creation failed') &&
-                    !output.includes('No device available');
+					!output.includes('No device available');
             })
             .orElse(() => TaskEither.of(false));
 
@@ -620,9 +675,9 @@ export class HardwareAccelerationDetector {
     }
 
     /**
-     * Get software encoding configuration (fallback)
-     * @returns Software encoding configuration
-     */
+	 * Get software encoding configuration (fallback)
+	 * @returns Software encoding configuration
+	 */
     private getSoftwareConfig (): HardwareAccelerationConfig {
         return {
             method: HardwareAccelerationMethod.NONE,
@@ -632,15 +687,15 @@ export class HardwareAccelerationDetector {
                 h265: ['-c:v', 'libx265', '-preset', 'faster'],
             },
             videoFilters: {
-                scale: 'scale=w=%width%:h=%height%:force_original_aspect_ratio=decrease',
+                scale: 'scale=w=%width%:h=%height%:force_original_aspect_ratio=decrease:force_divisible_by=2',
             },
         };
     }
 
     /**
-     * Get CUDA hardware acceleration configuration
-     * @returns CUDA hardware acceleration configuration
-     */
+	 * Get CUDA hardware acceleration configuration
+	 * @returns CUDA hardware acceleration configuration
+	 */
     private getCudaConfig (): HardwareAccelerationConfig {
         return {
             method: HardwareAccelerationMethod.CUDA,
@@ -655,17 +710,17 @@ export class HardwareAccelerationDetector {
                 h265: ['-c:v', 'hevc_nvenc', '-preset', 'fast', '-tune', 'hq', '-rc', 'constqp', '-cq', '25'],
             },
             videoFilters: {
-                scale: 'scale_cuda=w=%width%:h=%height%:force_original_aspect_ratio=decrease',
+                scale: 'scale_cuda=w=%width%:h=%height%:force_original_aspect_ratio=decrease:force_divisible_by=2',
                 deinterlace: 'yadif_cuda=0:-1:0',
             },
         };
     }
 
     /**
-     * Get VAAPI hardware acceleration configuration
-     * @param renderDevice Path to render device (e.g. /dev/dri/renderD128)
-     * @returns VAAPI hardware acceleration configuration
-     */
+	 * Get VAAPI hardware acceleration configuration
+	 * @param renderDevice Path to render device (e.g. /dev/dri/renderD128)
+	 * @returns VAAPI hardware acceleration configuration
+	 */
     private getVAAPIConfig (renderDevice: string): HardwareAccelerationConfig {
         return {
             method: HardwareAccelerationMethod.VAAPI,
@@ -683,15 +738,15 @@ export class HardwareAccelerationDetector {
                 h265: ['-c:v', 'hevc_vaapi', '-qp', '25'],
             },
             videoFilters: {
-                scale: 'scale_vaapi=w=%width%:h=%height%:force_original_aspect_ratio=decrease',
+                scale: 'scale_vaapi=w=%width%:h=%height%:force_original_aspect_ratio=decrease:force_divisible_by=2',
             },
         };
     }
 
     /**
-     * Get VideoToolbox hardware acceleration configuration
-     * @returns VideoToolbox hardware acceleration configuration
-     */
+	 * Get VideoToolbox hardware acceleration configuration
+	 * @returns VideoToolbox hardware acceleration configuration
+	 */
     private getVideoToolboxConfig (): HardwareAccelerationConfig {
         return {
             method: HardwareAccelerationMethod.VIDEOTOOLBOX,
@@ -701,15 +756,33 @@ export class HardwareAccelerationDetector {
                 h265: ['-c:v', 'hevc_videotoolbox', '-q:v', '32'],
             },
             videoFilters: {
-                scale: 'scale=w=%width%:h=%height%:force_original_aspect_ratio=decrease',
+                scale: 'scale=w=%width%:h=%height%:force_original_aspect_ratio=decrease:force_divisible_by=2',
             },
         };
     }
 
     /**
-     * Get Intel QuickSync Video hardware acceleration configuration
-     * @returns QSV hardware acceleration configuration
-     */
+	 * Get AMD AMF hardware acceleration configuration
+	 * @returns AMF hardware acceleration configuration
+	 */
+    private getAmfConfig (): HardwareAccelerationConfig {
+        return {
+            method: HardwareAccelerationMethod.AMF,
+            inputOptions: [],
+            outputOptions: {
+                h264: ['-c:v', 'h264_amf', '-quality', 'balanced'],
+                h265: ['-c:v', 'hevc_amf', '-quality', 'balanced'],
+            },
+            videoFilters: {
+                scale: 'scale=w=%width%:h=%height%:force_original_aspect_ratio=decrease:force_divisible_by=2',
+            },
+        };
+    }
+
+    /**
+	 * Get Intel QuickSync Video hardware acceleration configuration
+	 * @returns QSV hardware acceleration configuration
+	 */
     private getQsvConfig (): HardwareAccelerationConfig {
         return {
             method: HardwareAccelerationMethod.QSV,
@@ -724,7 +797,7 @@ export class HardwareAccelerationDetector {
                 h265: ['-c:v', 'hevc_qsv', '-q', '25'],
             },
             videoFilters: {
-                scale: 'scale_qsv=w=%width%:h=%height%',
+                scale: 'scale_qsv=w=%width%:h=%height%:force_divisible_by=2',
             },
         };
     }
