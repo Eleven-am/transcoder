@@ -1,9 +1,9 @@
-import * as path from 'path';
+import path from 'path';
 
 import { TaskEither } from '@eleven-am/fp';
 
 import { FileStorage } from './fileStorage';
-import { StreamType } from './types';
+import { SegmentStream, StreamType } from './types';
 
 export class MediaSource {
     constructor (
@@ -68,9 +68,12 @@ export class MediaSource {
      * @param quality The quality of the segment
      * @param segmentNumber The number of the segment
      */
-    getSegmentStream (streamType: StreamType, streamIndex: number, quality: string, segmentNumber: number): TaskEither<NodeJS.ReadableStream> {
+    getSegmentStream (streamType: StreamType, streamIndex: number, quality: string, segmentNumber: number): TaskEither<SegmentStream> {
         return this.getSegmentPath(streamType, streamIndex, quality, segmentNumber)
-            .chain((segmentPath) => this.storage.getFileStream(segmentPath));
+            .chain((segmentPath) => TaskEither.fromBind({
+                stream: this.storage.getFileStream(segmentPath),
+                size: this.storage.getFileSize(segmentPath),
+            }));
     }
 
     /**

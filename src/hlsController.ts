@@ -13,6 +13,7 @@ import {
     ClientSession,
     HardwareAccelerationConfig,
     HLSManagerOptions,
+    SegmentStream,
     StreamConfig,
     StreamMetricsEventHandler,
     StreamType,
@@ -93,7 +94,6 @@ export class HLSController {
                 void this.#prepareSegments(filePath, clientId, StreamType.AUDIO, masterPlaylist.audio.quality, masterPlaylist.audio.index, 0);
             })
             .map(({ master }) => master)
-            .ioErrorSync(console.log)
             .toPromise();
     }
 
@@ -119,7 +119,6 @@ export class HLSController {
             }))
             .ioSync(() => void this.#prepareSegments(filePath, clientId, type, quality, streamIndex, 0))
             .map(({ stream }) => stream.getPlaylist())
-            .ioErrorSync(console.log)
             .toPromise();
     }
 
@@ -132,7 +131,7 @@ export class HLSController {
      * @param streamIndex The stream index
      * @param segmentNumber The segment number to get
      */
-    getSegmentStream (filePath: string, clientId: string, type: StreamType, quality: string, streamIndex: number, segmentNumber: number): Promise<NodeJS.ReadableStream> {
+    getSegmentStream (filePath: string, clientId: string, type: StreamType, quality: string, streamIndex: number, segmentNumber: number): Promise<SegmentStream> {
         return this.#getStreamAndPriority(filePath, clientId, type, quality, streamIndex, segmentNumber)
             .ioSync(({ stream }) => this.#clientTracker.registerClientActivity({
                 clientId,
@@ -145,7 +144,6 @@ export class HLSController {
                 fileId: stream.getFileId(),
             }))
             .chain(({ stream, priority }) => stream.getSegmentStream(segmentNumber, priority))
-            .ioErrorSync(console.log)
             .toPromise();
     }
 
@@ -214,8 +212,6 @@ export class HLSController {
                 const stream = this.#streams.get(streamId);
 
                 if (!stream) {
-                    console.warn(`Stream not found for fileId ${data.fileId}`);
-
                     return;
                 }
 
@@ -280,7 +276,6 @@ export class HLSController {
         });
 
         this.#clientTracker.on('stream:abandoned', async ({ streamId }) => {
-            console.info(`Stream ${streamId} abandoned. Cleaning up resources.`);
             const stream = this.#streams.get(streamId);
 
             if (stream) {
@@ -387,6 +382,6 @@ export class HLSController {
     #prepareSegments (filePath: string, clientId: string, type: StreamType, quality: string, streamIndex: number, segmentNumber: number) {
         return this.#getStreamAndPriority(filePath, clientId, type, quality, streamIndex, segmentNumber)
             .chain(({ stream, priority }) => stream.buildTranscodeCommand(segmentNumber, priority))
-            .toPromise();
+            .toResult();
     }
 }

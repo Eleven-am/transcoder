@@ -220,3 +220,9 @@ export interface TranscodeJob {
     status: TranscodeStatus;
     process: FfmpegCommand;
 }
+
+export interface SegmentStream {
+    stream: NodeJS.ReadableStream;
+    size: number;
+}
+
