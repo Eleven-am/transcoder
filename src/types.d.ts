@@ -1,3 +1,5 @@
+import { ReadStream } from 'fs';
+
 export enum StreamType {
     VIDEO = 'v',
     AUDIO = 'a',
@@ -142,7 +144,7 @@ export interface ClientSession {
 }
 
 export interface SegmentStream {
-    stream: NodeJS.ReadableStream;
+    stream: ReadStream;
     size: number;
 }
 
