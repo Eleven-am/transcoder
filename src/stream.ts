@@ -191,21 +191,21 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Get the stream ID
-	 * @param fileId - The file ID
-	 * @param type - The type of the stream (audio or video)
-	 * @param quality - The quality of the stream
-	 * @param streamIndex - The index of the stream
-	 */
+    * Get the stream ID
+    * @param fileId - The file ID
+    * @param type - The type of the stream (audio or video)
+    * @param quality - The quality of the stream
+    * @param streamIndex - The index of the stream
+    */
     static getStreamId (fileId: string, type: StreamType, quality: string, streamIndex: number): string {
         return `${fileId}:${type}:${streamIndex}:${quality}`;
     }
 
     /**
-	 * Extract subtitle from a media source and convert to WebVTT
-	 * @param mediaSource - The media source
-	 * @param streamIndex - The index of the subtitle stream
-	 */
+    * Extract subtitle from a media source and convert to WebVTT
+    * @param mediaSource - The media source
+    * @param streamIndex - The index of the subtitle stream
+    */
     static getVTTSubtitle (mediaSource: MediaSource, streamIndex: number): Promise<NodeJS.ReadableStream> {
         return this.runFFMPEGCommand(
             [
@@ -221,17 +221,17 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Get all convertible subtitle streams from media metadata
-	 * @param metadata - The media metadata
-	 */
+    * Get all convertible subtitle streams from media metadata
+    * @param metadata - The media metadata
+    */
     static getConvertibleSubtitles (metadata: MediaMetadata): SubtitleInfo[] {
         return metadata.subtitles.filter((stream) => this.canConvertToVtt(stream));
     }
 
     /**
-	 * Check if a subtitle stream can be converted to VTT
-	 * @param subtitleStream - The subtitle stream
-	 */
+    * Check if a subtitle stream can be converted to VTT
+    * @param subtitleStream - The subtitle stream
+    */
     private static canConvertToVtt (subtitleStream: SubtitleInfo): boolean {
         const supportedCodecs = [
             'subrip',
@@ -250,14 +250,14 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         ];
 
         return supportedCodecs.includes(subtitleStream.codec) ||
-			(subtitleStream.extension !== null && supportedExtensions.includes(subtitleStream.extension));
+		(subtitleStream.extension !== null && supportedExtensions.includes(subtitleStream.extension));
     }
 
     /**
-	 * Run FFMPEG command
-	 * @param outputOptions - The output options to feed to the Ffmpeg
-	 * @param inputPath - The input path to the file to perform the command on
-	 */
+    * Run FFMPEG command
+    * @param outputOptions - The output options to feed to the Ffmpeg
+    * @param inputPath - The input path to the file to perform the command on
+    */
     private static runFFMPEGCommand (outputOptions: string[], inputPath: string) {
         return new Promise<Readable>((resolve, reject) => {
             const stream = ffmpeg(inputPath)
@@ -270,9 +270,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Create a screenshot from a media source at a specific timestamp
-	 * @param timestamp - The timestamp of the screenshot to be created
-	 */
+    * Create a screenshot from a media source at a specific timestamp
+    * @param timestamp - The timestamp of the screenshot to be created
+    */
     generateScreenshot (timestamp: number): Promise<NodeJS.ReadableStream> {
         const command = ffmpeg(this.source.getFilePath());
         const videoProfile = this.buildVideoQuality(this.videoQuality?.value ?? VideoQualityEnum.ORIGINAL);
@@ -308,31 +308,31 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Get the file ID
-	 */
+    * Get the file ID
+    */
     getFileId (): string {
         return this.metadata.id;
     }
 
     /**
-	 * Get stream configuration
-	 */
+    * Get stream configuration
+    */
     getConfig (): StreamConfig {
         return { ...this.config };
     }
 
     /**
-	 * Manually trigger metrics emission
-	 */
+    * Manually trigger metrics emission
+    */
     emitCurrentMetrics (): void {
         this.emitMetrics();
     }
 
     /**
-	 * Builds the transcode command for the stream
-	 * @param segmentIndex - The index of the segment
-	 * @param priority - The priority of the segment
-	 */
+    * Builds the transcode command for the stream
+    * @param segmentIndex - The index of the segment
+    * @param priority - The priority of the segment
+    */
     buildTranscodeCommand (segmentIndex: number, priority: number): TaskEither<void> {
         this.debounceDispose();
 
@@ -368,10 +368,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Get the segment stream for a specific segment
-	 * @param segmentIndex - The index of the segment
-	 * @param priority - The priority of the segment
-	 */
+    * Get the segment stream for a specific segment
+    * @param segmentIndex - The index of the segment
+    * @param priority - The priority of the segment
+    */
     getSegmentStream (segmentIndex: number, priority: number): TaskEither<SegmentStream> {
         this.debounceDispose();
 
@@ -380,8 +380,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Get the stream ID
-	 */
+    * Get the stream ID
+    */
     getStreamId (): string {
         return Stream.getStreamId(this.metadata.id, this.type, this.quality, this.streamIndex);
     }
