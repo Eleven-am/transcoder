@@ -373,7 +373,6 @@ export class MetadataService {
     private processSubtitleStream (stream: any, index: number): SubtitleInfo {
         const extension = this.getSubtitleExtension(stream.codec_name);
 
-
         return {
             index,
             extension,
