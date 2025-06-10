@@ -1,7 +1,7 @@
 import { ReadStream } from 'fs';
 
 import { DatabaseConnector } from './databaseConnector';
-import { DistributedConfig, RedisDistributedBackendOptions } from './distributed';
+import { DistributedConfig } from './distributed';
 import { FfmpegCommand } from './ffmpeg';
 
 export interface Stream {
@@ -234,5 +234,3 @@ export interface SegmentStream {
     stream: ReadStream;
     size: number;
 }
-
-export declare function createRedisBackend(options: RedisDistributedBackendOptions): DistributedConfig

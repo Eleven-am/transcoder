@@ -294,4 +294,4 @@ export declare class HLSController {
 	createMetadata (filePath: string): Promise<void>;
 }
 
-export declare function createRedisBackend(options: RedisDistributedBackendOptions): DistributedConfig
+export declare function createRedisBackend(options: RedisDistributedBackendOptions): Promise<DistributedConfig>;

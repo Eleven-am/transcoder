@@ -424,7 +424,7 @@ export class RedisEventBus implements EventBus {
  * Factory to create a complete Redis backend
  * Note: Requires two Redis clients for EventBus (publisher and subscriber)
  */
-export function createRedisBackend (options: RedisDistributedBackendOptions) {
+export async function createRedisBackend (options: RedisDistributedBackendOptions) {
     let client: RedisClientType;
 
     if ('url' in options.config) {
@@ -441,6 +441,8 @@ export function createRedisBackend (options: RedisDistributedBackendOptions) {
     }
 
     const subscriberClient = client.duplicate();
+
+    await Promise.all([client.connect(), subscriberClient.connect()]);
 
     return {
         stateStore: new RedisStateStore(client, options.options?.keyPrefix),
