@@ -359,7 +359,7 @@ export class RedisLockManager implements LockManager {
 export class RedisEventBus implements EventBus {
     private readonly subscriber: RedisClientType;
 
-    private readonly subscriptions = new Map<string,(event: any) => void>();
+    private readonly subscriptions = new Map<string, (event: any) => void>();
 
     constructor (
         private readonly publisher: RedisClientType,
@@ -424,7 +424,7 @@ export class RedisEventBus implements EventBus {
  * Factory to create a complete Redis backend
  * Note: Requires two Redis clients for EventBus (publisher and subscriber)
  */
-export async function createRedisBackend (options: RedisDistributedBackendOptions) {
+export function createRedisBackend (options: RedisDistributedBackendOptions) {
     let client: RedisClientType;
 
     if ('url' in options.config) {
@@ -442,7 +442,7 @@ export async function createRedisBackend (options: RedisDistributedBackendOption
 
     const subscriberClient = client.duplicate();
 
-    await Promise.all([client.connect(), subscriberClient.connect()]);
+    void Promise.all([client.connect(), subscriberClient.connect()]);
 
     return {
         stateStore: new RedisStateStore(client, options.options?.keyPrefix),
