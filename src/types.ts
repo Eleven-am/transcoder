@@ -1,6 +1,7 @@
 import { ReadStream } from 'fs';
 
 import { DatabaseConnector } from './databaseConnector';
+import { DistributedConfig } from './distributed';
 import { FfmpegCommand } from './ffmpeg';
 
 export interface Stream {
@@ -116,6 +117,7 @@ export interface HLSManagerOptions {
     videoQualities?: VideoQualityEnum[];
     audioQualities?: AudioQualityEnum[];
     config?: Partial<StreamConfig>;
+    distributed?: DistributedConfig;
 }
 
 export interface StreamConfig {
@@ -228,4 +230,3 @@ export interface SegmentStream {
     stream: ReadStream;
     size: number;
 }
-

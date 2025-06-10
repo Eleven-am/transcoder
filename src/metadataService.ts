@@ -4,6 +4,7 @@ import * as path from 'path';
 import { createBadRequestError, TaskEither } from '@eleven-am/fp';
 
 import { DatabaseConnector } from './databaseConnector';
+import { LockManager } from './distributed';
 import { MediaSource } from './mediaSource';
 import { QualityService } from './qualityService';
 import {
@@ -34,6 +35,7 @@ export class MetadataService {
     constructor (
         private readonly qualityService: QualityService,
         private readonly databaseConnector: DatabaseConnector,
+        private readonly lockManager?: LockManager,
     ) {}
 
     /**
@@ -51,8 +53,7 @@ export class MetadataService {
                 },
                 {
                     predicate: ({ exists }) => !exists,
-                    run: ({ fileId }) => this.extractMediaInfo(fileId, source)
-                        .fromPromise((metadata) => this.databaseConnector.saveMetadata(fileId, metadata)),
+                    run: ({ fileId }) => this.extractMetadataWithLock(fileId, source),
                 },
             ]);
     }
@@ -165,6 +166,70 @@ export class MetadataService {
      */
     createMetadata (source: MediaSource): TaskEither<void> {
         return this.getMetadata(source).map(() => undefined);
+    }
+
+    /**
+     * Extract metadata with distributed locking to prevent duplicate extraction
+     * @param fileId Unique identifier for the media file
+     * @param source Media source to extract metadata from
+     */
+    private extractMetadataWithLock (fileId: string, source: MediaSource): TaskEither<MediaMetadata> {
+        if (!this.lockManager) {
+            return this.extractMediaInfo(fileId, source)
+                .fromPromise((metadata) => this.databaseConnector.saveMetadata(fileId, metadata));
+        }
+
+        const lockKey = `metadata:extract:${fileId}`;
+        const lockTTL = 300000;
+
+        return TaskEither
+            .tryCatch(() => this.lockManager!.tryAcquire(lockKey, lockTTL))
+            .matchTask([
+                {
+                    predicate: (lock) => Boolean(lock),
+                    run: (lock) => this.extractMediaInfo(fileId, source)
+                        .fromPromise((metadata) => this.databaseConnector.saveMetadata(fileId, metadata))
+                        .tap(() => lock!.release()),
+                },
+                {
+                    predicate: (lock) => !lock,
+                    run: () => this.waitForMetadata(fileId),
+                },
+            ]);
+    }
+
+    /**
+     * Wait for another node to finish extracting metadata
+     * @param fileId The file ID to wait for
+     */
+    private waitForMetadata (fileId: string): TaskEither<MediaMetadata> {
+        const maxWaitTime = 300000;
+        const checkInterval = 1000;
+        const startTime = Date.now();
+
+        const checkMetadata = () => TaskEither
+            .tryCatch(() => this.databaseConnector.metadataExists(fileId))
+            .matchTask([
+                {
+                    predicate: ({ exists }) => exists,
+                    run: ({ fileId }) => TaskEither
+                        .tryCatch(() => this.databaseConnector.getMetadata(fileId)),
+                },
+                {
+                    predicate: () => (Date.now() - startTime) > maxWaitTime,
+                    run: () => TaskEither.error<MediaMetadata>(
+                        createBadRequestError('Timeout waiting for metadata extraction'),
+                    ),
+                },
+                {
+                    predicate: ({ exists }) => !exists,
+                    run: () => TaskEither
+                        .tryCatch(() => new Promise((resolve) => setTimeout(resolve, checkInterval)))
+                        .chain(() => checkMetadata()),
+                },
+            ]);
+
+        return checkMetadata();
     }
 
     /**
