@@ -14,6 +14,7 @@ export {
     LockManager,
     EventBus,
     DistributedConfig,
+    RedisDistributedBackendOptions,
 } from './interfaces';
 
 // Export in-memory implementations

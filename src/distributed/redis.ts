@@ -12,10 +12,10 @@
  * ```
  */
 
-import type { RedisClientType } from 'redis';
+import { createClient, RedisClientType } from 'redis';
 
 import { TranscodeJob } from '../types';
-import { EventBus, JobQueue, Lock, LockManager, StateStore } from './interfaces';
+import { EventBus, JobQueue, Lock, LockManager, RedisDistributedBackendOptions, StateStore } from './interfaces';
 
 /**
  * Redis implementation of StateStore
@@ -424,20 +424,29 @@ export class RedisEventBus implements EventBus {
  * Factory to create a complete Redis backend
  * Note: Requires two Redis clients for EventBus (publisher and subscriber)
  */
-export function createRedisBackend (
-    client: RedisClientType,
-    subscriberClient: RedisClientType,
-    options: {
-        keyPrefix?: string;
-        queueName?: string;
-        lockPrefix?: string;
-        channelPrefix?: string;
-    } = {},
-) {
+export function createRedisBackend (options: RedisDistributedBackendOptions) {
+    let client: RedisClientType;
+
+    if ('url' in options.config) {
+        client = createClient({ url: options.config.url });
+    } else {
+        client = createClient({
+            socket: {
+                host: options.config.host,
+                port: options.config.port,
+            },
+            password: options.config.password,
+            database: options.config.database,
+        });
+    }
+
+    const subscriberClient = client.duplicate();
+
     return {
-        stateStore: new RedisStateStore(client, options.keyPrefix),
-        jobQueue: new RedisJobQueue(client, options.queueName),
-        lockManager: new RedisLockManager(client, options.lockPrefix),
-        eventBus: new RedisEventBus(client, subscriberClient, options.channelPrefix),
+        stateStore: new RedisStateStore(client, options.options?.keyPrefix),
+        jobQueue: new RedisJobQueue(client, options.options?.queueName),
+        lockManager: new RedisLockManager(client, options.options?.lockPrefix),
+        eventBus: new RedisEventBus(client, subscriberClient, options.options?.channelPrefix),
     };
 }
+

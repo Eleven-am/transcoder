@@ -176,3 +176,20 @@ export interface DistributedConfig {
     lockManager?: LockManager;
     eventBus?: EventBus;
 }
+
+export interface RedisDistributedBackendOptions {
+    config: {
+        host: string;
+        port: number;
+        password?: string;
+        database?: number;
+    } | {
+        url: string;
+    };
+    options?: {
+        keyPrefix?: string;
+        queueName?: string;
+        lockPrefix?: string;
+        channelPrefix?: string;
+    };
+}
