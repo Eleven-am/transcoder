@@ -159,21 +159,21 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Create a new stream
-	 * @param quality - The quality of the stream
-	 * @param type - The type of the stream (audio or video)
-	 * @param streamIndex - The index of the stream
-	 * @param source - The media source
-	 * @param maxSegmentBatchSize - The maximum number of segments to process at once
-	 * @param qualityService - The quality service
-	 * @param metadataService - The metadata service
-	 * @param hwDetector - The hardware acceleration detector
-	 * @param hwAccel - The hardware acceleration configuration
-	 * @param config - The stream configuration
-	 * @param stateStore - The distributed state store
-	 * @param lockManager - The distributed lock manager
-	 * @param eventBus - The distributed event bus
-	 */
+     * Create a new stream
+     * @param quality - The quality of the stream
+     * @param type - The type of the stream (audio or video)
+     * @param streamIndex - The index of the stream
+     * @param source - The media source
+     * @param maxSegmentBatchSize - The maximum number of segments to process at once
+     * @param qualityService - The quality service
+     * @param metadataService - The metadata service
+     * @param hwDetector - The hardware acceleration detector
+     * @param hwAccel - The hardware acceleration configuration
+     * @param config - The stream configuration
+     * @param stateStore - The distributed state store
+     * @param lockManager - The distributed lock manager
+     * @param eventBus - The distributed event bus
+     */
     static create (
         quality: string,
         type: StreamType,
@@ -213,21 +213,21 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Get the stream ID
-	 * @param fileId - The file ID
-	 * @param type - The type of the stream (audio or video)
-	 * @param quality - The quality of the stream
-	 * @param streamIndex - The index of the stream
-	 */
+    * Get the stream ID
+    * @param fileId - The file ID
+    * @param type - The type of the stream (audio or video)
+    * @param quality - The quality of the stream
+    * @param streamIndex - The index of the stream
+    */
     static getStreamId (fileId: string, type: StreamType, quality: string, streamIndex: number): string {
         return `${fileId}:${type}:${streamIndex}:${quality}`;
     }
 
     /**
-	 * Extract subtitle from a media source and convert to WebVTT
-	 * @param mediaSource - The media source
-	 * @param streamIndex - The index of the subtitle stream
-	 */
+    * Extract subtitle from a media source and convert to WebVTT
+    * @param mediaSource - The media source
+    * @param streamIndex - The index of the subtitle stream
+    */
     static getVTTSubtitle (mediaSource: MediaSource, streamIndex: number): Promise<NodeJS.ReadableStream> {
         return this.runFFMPEGCommand(
             [
@@ -272,7 +272,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         ];
 
         return supportedCodecs.includes(subtitleStream.codec) ||
-			(subtitleStream.extension !== null && supportedExtensions.includes(subtitleStream.extension));
+                   (subtitleStream.extension !== null && supportedExtensions.includes(subtitleStream.extension));
     }
 
     /**
@@ -1462,13 +1462,13 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Retry transcoding with software fallback
-	 * @param segment - The segment to retry
-	 * @param originalJob - The original job
-	 * @param lock - The distributed lock (if any)
-	 * @param resolve - Resolve function
-	 * @param reject - Reject function
-	 */
+     * Retry transcoding with software fallback
+     * @param segment - The segment to retry
+     * @param originalJob - The original job
+     * @param lock - The distributed lock (if any)
+     * @param resolve - Resolve function
+     * @param reject - Reject function
+     */
     private retryWithFallback (
         segment: Segment,
         originalJob: TranscodeJob,

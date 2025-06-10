@@ -1,6 +1,7 @@
 import { createBadRequestError, TaskEither } from '@eleven-am/fp';
 
 import { ClientTracker } from './clientTracker';
+import { createBackendConfig, EventBus, LockManager, StateStore } from './distributed';
 import { FileDatabase } from './fileDatabase';
 import { FileStorage } from './fileStorage';
 import { HardwareAccelerationDetector } from './hardwareAccelerationDetector';
@@ -46,20 +47,52 @@ export class HLSController {
 
     readonly #hwAccelEnabled: boolean;
 
+    readonly #stateStore: StateStore;
+
+    readonly #lockManager: LockManager;
+
+    readonly #eventBus: EventBus;
+
+    readonly #nodeId: string;
+
+    private distributedSyncInterval: NodeJS.Timeout | null = null;
+
     constructor (options: HLSManagerOptions) {
+        this.#nodeId = `controller-${process.pid}-${Date.now()}`;
         this.#streams = new Map<string, Stream>();
 
         this.#hwAccelEnabled = options.hwAccel || false;
         this.#maxSegmentBatchSize = options.maxSegmentBatchSize || 100;
         this.streamConfig = options.config || {};
 
+        // Create distributed backend (falls back to in-memory if not provided)
+        const backend = createBackendConfig(options.distributed);
+
+        this.#stateStore = backend.stateStore;
+        this.#lockManager = backend.lockManager;
+        this.#eventBus = backend.eventBus;
+
         this.#hwDetector = new HardwareAccelerationDetector();
         this.#fileStorage = new FileStorage(options.cacheDirectory);
         const database = options.database || new FileDatabase(this.#fileStorage);
 
         this.#qualityService = new QualityService(options.videoQualities, options.audioQualities);
-        this.#metadataService = new MetadataService(this.#qualityService, database);
-        this.#clientTracker = new ClientTracker(this.#qualityService);
+        this.#metadataService = new MetadataService(
+            this.#qualityService,
+            database,
+            options.distributed?.lockManager,
+        );
+
+        this.#clientTracker = new ClientTracker(
+            this.#qualityService,
+            undefined, // inactivityCheckFrequency
+            undefined, // unusedStreamDebounceDelay
+            undefined, // inactivityThreshold
+            undefined, // maxConcurrentJobs
+            options.distributed?.stateStore,
+            options.distributed?.jobQueue,
+            options.distributed?.eventBus,
+        );
     }
 
     /**
@@ -68,6 +101,7 @@ export class HLSController {
      */
     initialize (): Promise<void> {
         this.#hookUpClientTracker();
+        this.#initializeDistributedSync();
 
         return this.#hwDetector.detectHardwareAcceleration()
             .filter(
@@ -259,6 +293,143 @@ export class HLSController {
     }
 
     /**
+     * Dispose of the controller and clean up resources
+     */
+    dispose (): void {
+        if (this.distributedSyncInterval) {
+            clearInterval(this.distributedSyncInterval);
+            this.distributedSyncInterval = null;
+        }
+
+        // Dispose all streams
+        for (const stream of this.#streams.values()) {
+            void stream.dispose();
+        }
+        this.#streams.clear();
+
+        // Dispose client tracker
+        this.#clientTracker.dispose();
+
+        // Clean up distributed state
+        void this.#cleanupDistributedState();
+    }
+
+    /**
+     * Initialize distributed synchronization
+     * @private
+     */
+    #initializeDistributedSync (): void {
+        // Subscribe to distributed events
+        void this.#subscribeToDistributedEvents();
+
+        // Sync with distributed state periodically
+        this.distributedSyncInterval = setInterval(() => {
+            void this.#syncWithDistributedStreams();
+        }, 30_000); // Every 30 seconds
+
+        // Initial sync
+        void this.#syncWithDistributedStreams();
+    }
+
+    /**
+     * Subscribe to distributed events
+     * @private
+     */
+    async #subscribeToDistributedEvents (): Promise<void> {
+        // Subscribe to stream lifecycle events
+        await this.#eventBus.subscribe('stream:created', (event) => {
+            if (event.nodeId !== this.#nodeId) {
+                // Update local cache with remote stream info
+                void this.#cacheRemoteStreamInfo(event);
+            }
+        });
+
+        await this.#eventBus.subscribe('stream:disposed', (event) => {
+            if (event.nodeId !== this.#nodeId) {
+                // Remove stream from local cache
+                this.#streams.delete(event.streamId);
+            }
+        });
+
+        // Subscribe to metrics events if handler is set
+        await this.#eventBus.subscribe('stream:metrics', (event) => {
+            if (this.#streamMetricsEventHandler) {
+                this.#streamMetricsEventHandler(event);
+            }
+        });
+    }
+
+    /**
+     * Cache information about remote streams
+     * @private
+     */
+    #cacheRemoteStreamInfo (event: any): TaskEither<void> {
+        const streamKey = `stream:info:${event.streamId}`;
+
+        return TaskEither
+            .tryCatch(
+                () => this.#stateStore.set(streamKey, {
+                    streamId: event.streamId,
+                    nodeId: event.nodeId,
+                    type: event.type,
+                    quality: event.quality,
+                    streamIndex: event.streamIndex,
+                    fileId: event.fileId,
+                    createdAt: event.createdAt,
+                }, 300_000),
+                'Failed to cache stream info',
+            )
+            .map(() => undefined);
+    }
+
+    /**
+     * Sync with distributed stream information
+     * @private
+     */
+    #syncWithDistributedStreams (): TaskEither<void> {
+        return TaskEither
+            .tryCatch(
+                () => this.#stateStore.keys('stream:info:*'),
+                'Failed to get stream keys',
+            )
+            .chain((keys) => TaskEither
+                .tryCatch(
+                    () => this.#stateStore.getMany<any>(keys),
+                    'Failed to get stream info',
+                ))
+            .map((streamsMap) => {
+                // Update local knowledge of distributed streams
+                for (const [key, streamInfo] of streamsMap.entries()) {
+                    if (streamInfo && streamInfo.nodeId !== this.#nodeId) {
+                        // Track that this stream exists on another node
+                        // This helps with load balancing decisions
+                    }
+                }
+            });
+    }
+
+    /**
+     * Cleanup distributed state on disposal
+     * @private
+     */
+    async #cleanupDistributedState (): Promise<void> {
+        try {
+            // Clean up any stream info created by this node
+            const streamKeys = await this.#stateStore.keys('stream:info:*');
+
+            for (const key of streamKeys) {
+                const streamInfo = await this.#stateStore.get<any>(key);
+
+                if (streamInfo && streamInfo.nodeId === this.#nodeId) {
+                    await this.#stateStore.delete(key);
+                }
+            }
+        } catch (error) {
+            console.error('Failed to cleanup distributed state:', error);
+        }
+    }
+
+    /**
      * Set up client tracker event listeners
      * @private
      */
@@ -292,6 +463,13 @@ export class HLSController {
 
         stream.on('dispose', ({ id }) => {
             this.#streams.delete(id);
+
+            // Publish stream disposal to distributed system
+            void this.#eventBus.publish('stream:disposed', {
+                nodeId: this.#nodeId,
+                streamId: id,
+                timestamp: Date.now(),
+            });
         });
 
         stream.on('stream:metrics', (event) => {
@@ -312,7 +490,7 @@ export class HLSController {
     #getOrCreateStream (filePath: string, type: StreamType, quality: string, streamIndex: number): TaskEither<Stream> {
         const source = this.#buildMediaSource(filePath);
 
-        const create = Stream
+        const createStream = () => Stream
             .create(
                 quality,
                 type,
@@ -324,15 +502,63 @@ export class HLSController {
                 this.#hwDetector,
                 this.#hwConfig,
                 this.streamConfig,
+                this.#stateStore,
+                this.#lockManager,
+                this.#eventBus,
             )
             .ioSync((stream) => this.#hookUpStream(stream))
-            .ioSync((stream) => this.#streams.set(stream.getStreamId(), stream));
+            .ioSync((stream) => {
+                this.#streams.set(stream.getStreamId(), stream);
+
+                // Publish stream creation to distributed system
+                void this.#eventBus.publish('stream:created', {
+                    nodeId: this.#nodeId,
+                    streamId: stream.getStreamId(),
+                    type,
+                    quality,
+                    streamIndex,
+                    fileId: stream.getFileId(),
+                    createdAt: Date.now(),
+                });
+            });
 
         return source.getFileId()
-            .map((fileId) => Stream.getStreamId(fileId, type, quality, streamIndex))
-            .map((streamId) => this.#streams.get(streamId))
-            .nonNullable('Stream not found')
-            .orElse(() => create);
+            .chain((fileId) => {
+                const streamId = Stream.getStreamId(fileId, type, quality, streamIndex);
+                const localStream = this.#streams.get(streamId);
+
+                if (localStream) {
+                    return TaskEither.of(localStream);
+                }
+
+                // Check if stream exists on another node
+                return this.#checkDistributedStreamExists(streamId)
+                    .matchTask([
+                        {
+                            predicate: (exists) => exists,
+                            run: () => createStream(),
+                        },
+                        {
+                            predicate: () => true,
+                            run: () => createStream(),
+                        },
+                    ]);
+            });
+    }
+
+    /**
+     * Check if a stream exists on another node
+     * @private
+     */
+    #checkDistributedStreamExists (streamId: string): TaskEither<boolean> {
+        const streamKey = `stream:info:${streamId}`;
+
+        return TaskEither
+            .tryCatch(
+                () => this.#stateStore.get<any>(streamKey),
+                'Failed to check distributed stream',
+            )
+            .map((streamInfo) => streamInfo !== null);
     }
 
     /**
