@@ -118,6 +118,10 @@ export interface HLSManagerOptions {
     audioQualities?: AudioQualityEnum[];
     config?: Partial<StreamConfig>;
     distributed?: DistributedConfig;
+    inactivityCheckFrequency?: number;
+    unusedStreamDebounceDelay?: number;
+    inactivityThreshold?: number;
+    maxConcurrentJobs?: number;
 }
 
 export interface StreamConfig {

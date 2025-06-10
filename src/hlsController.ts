@@ -85,10 +85,10 @@ export class HLSController {
 
         this.#clientTracker = new ClientTracker(
             this.#qualityService,
-            undefined, // inactivityCheckFrequency
-            undefined, // unusedStreamDebounceDelay
-            undefined, // inactivityThreshold
-            undefined, // maxConcurrentJobs
+            options.inactivityCheckFrequency,
+            options.unusedStreamDebounceDelay,
+            options.inactivityThreshold,
+            options.maxConcurrentJobs,
             options.distributed?.stateStore,
             options.distributed?.jobQueue,
             options.distributed?.eventBus,
@@ -319,15 +319,12 @@ export class HLSController {
      * @private
      */
     #initializeDistributedSync (): void {
-        // Subscribe to distributed events
         void this.#subscribeToDistributedEvents();
 
-        // Sync with distributed state periodically
         this.distributedSyncInterval = setInterval(() => {
             void this.#syncWithDistributedStreams();
-        }, 30_000); // Every 30 seconds
+        }, 30_000);
 
-        // Initial sync
         void this.#syncWithDistributedStreams();
     }
 
@@ -336,17 +333,14 @@ export class HLSController {
      * @private
      */
     async #subscribeToDistributedEvents (): Promise<void> {
-        // Subscribe to stream lifecycle events
         await this.#eventBus.subscribe('stream:created', (event) => {
             if (event.nodeId !== this.#nodeId) {
-                // Update local cache with remote stream info
                 void this.#cacheRemoteStreamInfo(event);
             }
         });
 
         await this.#eventBus.subscribe('stream:disposed', (event) => {
             if (event.nodeId !== this.#nodeId) {
-                // Remove stream from local cache
                 this.#streams.delete(event.streamId);
             }
         });
