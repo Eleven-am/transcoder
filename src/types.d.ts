@@ -1,7 +1,8 @@
 import { ReadStream } from 'fs';
 import { Readable } from 'stream';
 
-import { DistributedConfig } from './distributed';
+import {DistributedConfig, RedisDistributedBackendOptions} from './distributed';
+import {StreamConfig} from "./types";
 
 export enum StreamType {
 	VIDEO = 'v',
@@ -115,7 +116,12 @@ export interface HLSManagerOptions {
 	maxSegmentBatchSize?: number;
 	videoQualities?: VideoQualityEnum[];
 	audioQualities?: AudioQualityEnum[];
+	config?: Partial<StreamConfig>;
 	distributed?: DistributedConfig;
+	inactivityCheckFrequency?: number;
+	unusedStreamDebounceDelay?: number;
+	inactivityThreshold?: number;
+	maxConcurrentJobs?: number;
 }
 
 export interface VideoQuality {
@@ -287,3 +293,5 @@ export declare class HLSController {
 	 */
 	createMetadata (filePath: string): Promise<void>;
 }
+
+export declare function createRedisBackend(options: RedisDistributedBackendOptions): DistributedConfig
