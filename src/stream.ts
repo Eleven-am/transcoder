@@ -1298,12 +1298,12 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             this.emitMetrics();
         });
 
-        command.on('progress', (progress) => {
+        command.on('progress', async (progress) => {
             lastIndex = progress.segment;
             this.handleSegmentProgress(progress.segment, segments);
 
             // Extend lock periodically
-            if (lock && lock.isValid()) {
+            if (lock && await lock.isValid()) {
                 void lock.extend(this.config.segmentTimeout * 2);
             }
         });
