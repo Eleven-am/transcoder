@@ -3,6 +3,7 @@ import { Readable } from 'stream';
 
 import { createBadRequestError, createNotFoundError, Deferred, Either, Result, sortBy, TaskEither } from '@eleven-am/fp';
 
+import { EventBus, Lock, LockManager, StateStore } from './distributed';
 import ffmpeg, { FfmpegCommand } from './ffmpeg';
 import { HardwareAccelerationDetector } from './hardwareAccelerationDetector';
 import { MediaSource } from './mediaSource';
@@ -65,6 +66,12 @@ interface DetailedVideoQuality extends VideoQuality {
     height: number;
 }
 
+interface SegmentState {
+    status: 'pending' | 'processing' | 'completed' | 'failed';
+    processingNode?: string;
+    lastUpdated: number;
+}
+
 export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     private static readonly DEFAULT_CONFIG: StreamConfig = {
         disposeTimeout: 30 * 60 * 1000,
@@ -75,6 +82,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         metricsInterval: 30_000,
         maxRetries: 3,
     };
+
+    private readonly nodeId: string;
 
     private readonly videoQuality: VideoQuality | null;
 
@@ -113,9 +122,13 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         private readonly hwDetector: HardwareAccelerationDetector,
         private readonly optimisedAccel: HardwareAccelerationConfig | null,
         config: Partial<StreamConfig>,
+        private readonly stateStore?: StateStore,
+        private readonly lockManager?: LockManager,
+        private readonly eventBus?: EventBus,
     ) {
         super();
 
+        this.nodeId = `node-${process.pid}-${Date.now()}`;
         this.config = {
             ...Stream.DEFAULT_CONFIG,
             ...config,
@@ -146,18 +159,21 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Create a new stream
-     * @param quality - The quality of the stream
-     * @param type - The type of the stream (audio or video)
-     * @param streamIndex - The index of the stream
-     * @param source - The media source
-     * @param maxSegmentBatchSize - The maximum number of segments to process at once
-     * @param qualityService - The quality service
-     * @param metadataService - The metadata service
-     * @param hwDetector - The hardware acceleration detector
-     * @param hwAccel - The hardware acceleration configuration
-     * @param config - The stream configuration
-     */
+	 * Create a new stream
+	 * @param quality - The quality of the stream
+	 * @param type - The type of the stream (audio or video)
+	 * @param streamIndex - The index of the stream
+	 * @param source - The media source
+	 * @param maxSegmentBatchSize - The maximum number of segments to process at once
+	 * @param qualityService - The quality service
+	 * @param metadataService - The metadata service
+	 * @param hwDetector - The hardware acceleration detector
+	 * @param hwAccel - The hardware acceleration configuration
+	 * @param config - The stream configuration
+	 * @param stateStore - The distributed state store
+	 * @param lockManager - The distributed lock manager
+	 * @param eventBus - The distributed event bus
+	 */
     static create (
         quality: string,
         type: StreamType,
@@ -169,6 +185,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         hwDetector: HardwareAccelerationDetector,
         hwAccel: HardwareAccelerationConfig | null,
         config: Partial<StreamConfig>,
+        stateStore?: StateStore,
+        lockManager?: LockManager,
+        eventBus?: EventBus,
     ): TaskEither<Stream> {
         return TaskEither
             .fromBind({
@@ -186,26 +205,29 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 hwDetector,
                 optimisedAccel,
                 config,
+                stateStore,
+                lockManager,
+                eventBus,
             ))
             .chain((stream) => stream.initialise());
     }
 
     /**
-     * Get the stream ID
-     * @param fileId - The file ID
-     * @param type - The type of the stream (audio or video)
-     * @param quality - The quality of the stream
-     * @param streamIndex - The index of the stream
-     */
+	 * Get the stream ID
+	 * @param fileId - The file ID
+	 * @param type - The type of the stream (audio or video)
+	 * @param quality - The quality of the stream
+	 * @param streamIndex - The index of the stream
+	 */
     static getStreamId (fileId: string, type: StreamType, quality: string, streamIndex: number): string {
         return `${fileId}:${type}:${streamIndex}:${quality}`;
     }
 
     /**
-     * Extract subtitle from a media source and convert to WebVTT
-     * @param mediaSource - The media source
-     * @param streamIndex - The index of the subtitle stream
-     */
+	 * Extract subtitle from a media source and convert to WebVTT
+	 * @param mediaSource - The media source
+	 * @param streamIndex - The index of the subtitle stream
+	 */
     static getVTTSubtitle (mediaSource: MediaSource, streamIndex: number): Promise<NodeJS.ReadableStream> {
         return this.runFFMPEGCommand(
             [
@@ -221,17 +243,17 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Get all convertible subtitle streams from media metadata
-     * @param metadata - The media metadata
-     */
+	 * Get all convertible subtitle streams from media metadata
+	 * @param metadata - The media metadata
+	 */
     static getConvertibleSubtitles (metadata: MediaMetadata): SubtitleInfo[] {
         return metadata.subtitles.filter((stream) => this.canConvertToVtt(stream));
     }
 
     /**
-     * Check if a subtitle stream can be converted to VTT
-     * @param subtitleStream - The subtitle stream
-     */
+	 * Check if a subtitle stream can be converted to VTT
+	 * @param subtitleStream - The subtitle stream
+	 */
     private static canConvertToVtt (subtitleStream: SubtitleInfo): boolean {
         const supportedCodecs = [
             'subrip',
@@ -250,14 +272,14 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         ];
 
         return supportedCodecs.includes(subtitleStream.codec) ||
-            (subtitleStream.extension !== null && supportedExtensions.includes(subtitleStream.extension));
+			(subtitleStream.extension !== null && supportedExtensions.includes(subtitleStream.extension));
     }
 
     /**
-     * Run FFMPEG command
-     * @param outputOptions - The output options to feed to the Ffmpeg
-     * @param inputPath - The input path to the file to perform the command on
-     */
+	 * Run FFMPEG command
+	 * @param outputOptions - The output options to feed to the Ffmpeg
+	 * @param inputPath - The input path to the file to perform the command on
+	 */
     private static runFFMPEGCommand (outputOptions: string[], inputPath: string) {
         return new Promise<Readable>((resolve, reject) => {
             const stream = ffmpeg(inputPath)
@@ -270,9 +292,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Create a screenshot from a media source at a specific timestamp
-     * @param timestamp - The timestamp of the screenshot to be created
-     */
+	 * Create a screenshot from a media source at a specific timestamp
+	 * @param timestamp - The timestamp of the screenshot to be created
+	 */
     generateScreenshot (timestamp: number): Promise<NodeJS.ReadableStream> {
         const command = ffmpeg(this.source.getFilePath());
         const videoProfile = this.buildVideoQuality(this.videoQuality?.value ?? VideoQualityEnum.ORIGINAL);
@@ -308,17 +330,17 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Get the file ID
-     */
+	 * Get the file ID
+	 */
     getFileId (): string {
         return this.metadata.id;
     }
 
     /**
-     * Builds the transcode command for the stream
-     * @param segmentIndex - The index of the segment
-     * @param priority - The priority of the segment
-     */
+	 * Builds the transcode command for the stream
+	 * @param segmentIndex - The index of the segment
+	 * @param priority - The priority of the segment
+	 */
     buildTranscodeCommand (segmentIndex: number, priority: number): TaskEither<void> {
         this.debounceDispose();
 
@@ -328,6 +350,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 exists: this.source.segmentExist(this.type, this.streamIndex, this.quality, segmentIndex),
                 segment: TaskEither.fromNullable(this.segments.get(segmentIndex)),
                 isScheduled: TaskEither.of(this.isSegmentScheduled(segmentIndex)),
+                distributedState: this.getDistributedSegmentState(segmentIndex),
             })
             .matchTask([
                 {
@@ -335,9 +358,14 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                     run: () => TaskEither.of(undefined),
                 },
                 {
+                    predicate: ({ distributedState }) => distributedState?.status === 'processing' &&
+						distributedState.processingNode !== this.nodeId,
+                    run: ({ segment, distributedState }) => this.waitForRemoteSegment(segment, distributedState!),
+                },
+                {
                     predicate: ({ isScheduled, distance, segment }) => isScheduled &&
-                        distance <= this.config.maxEncoderDistance &&
-                        segment.value?.state() !== 'rejected',
+						distance <= this.config.maxEncoderDistance &&
+						segment.value?.state() !== 'rejected',
                     run: ({ segment }) => TaskEither
                         .fromResult(() => segment.value!.promise())
                         .timed(this.config.segmentTimeout, `Timed out waiting for segment ${segment.index}`),
@@ -354,10 +382,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Get the segment stream for a specific segment
-     * @param segmentIndex - The index of the segment
-     * @param priority - The priority of the segment
-     */
+	 * Get the segment stream for a specific segment
+	 * @param segmentIndex - The index of the segment
+	 * @param priority - The priority of the segment
+	 */
     getSegmentStream (segmentIndex: number, priority: number): TaskEither<SegmentStream> {
         this.debounceDispose();
 
@@ -366,15 +394,15 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Get the stream ID
-     */
+	 * Get the stream ID
+	 */
     getStreamId (): string {
         return Stream.getStreamId(this.metadata.id, this.type, this.quality, this.streamIndex);
     }
 
     /**
-     * Creates a new playlist for the stream
-     */
+	 * Creates a new playlist for the stream
+	 */
     getPlaylist (): string {
         this.debounceDispose();
 
@@ -400,10 +428,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Builds the video quality for the stream
-     * @param quality - The video quality to build
-     * @param index - The index of the video stream
-     */
+	 * Builds the video quality for the stream
+	 * @param quality - The video quality to build
+	 * @param index - The index of the video stream
+	 */
     buildVideoQuality (quality: VideoQualityEnum, index?: number): DetailedVideoQuality {
         const videoInfo = this.metadata.videos[index ?? this.streamIndex];
         const profile = this.qualityService.buildValidVideoQuality(quality, videoInfo);
@@ -422,10 +450,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Builds the audio quality for the stream
-     * @param quality - The audio quality to build
-     * @param index - The index of the audio stream
-     */
+	 * Builds the audio quality for the stream
+	 * @param quality - The audio quality to build
+	 * @param index - The index of the audio stream
+	 */
     buildAudioQuality (quality: AudioQualityEnum, index?: number): AudioQuality {
         const audioInfo = this.metadata.audios[index ?? this.streamIndex];
 
@@ -433,8 +461,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Dispose of the stream
-     */
+	 * Dispose of the stream
+	 */
     dispose (): Promise<Result<void>> {
         this.segments.forEach((segment) => {
             if (segment.value?.state() === 'pending') {
@@ -459,6 +487,11 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             clearInterval(this.metricsTimer);
         }
 
+        // Clean up distributed state
+        if (this.stateStore) {
+            void this.cleanupDistributedState();
+        }
+
         this.emit('dispose', { id: this.getStreamId() });
 
         return this.source.deleteTempFiles()
@@ -470,6 +503,148 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 this.removeAllListeners();
             })
             .toResult();
+    }
+
+    /**
+	 * Get distributed segment state
+	 */
+    private getDistributedSegmentState (segmentIndex: number): TaskEither<SegmentState | null> {
+        if (!this.stateStore) {
+            return TaskEither.of(null);
+        }
+
+        const stateKey = `segment:${this.getStreamId()}:${segmentIndex}`;
+
+        return TaskEither
+            .tryCatch(
+                () => this.stateStore!.get<SegmentState>(stateKey),
+                'Failed to get segment state',
+            );
+    }
+
+    /**
+	 * Update distributed segment state
+	 */
+    private updateDistributedSegmentState (segmentIndex: number, state: Partial<SegmentState>): TaskEither<void> {
+        if (!this.stateStore) {
+            return TaskEither.of(undefined);
+        }
+
+        const stateKey = `segment:${this.getStreamId()}:${segmentIndex}`;
+        const newState: SegmentState = {
+            status: state.status || 'pending',
+            processingNode: state.processingNode || this.nodeId,
+            lastUpdated: Date.now(),
+        };
+
+        return TaskEither
+            .tryCatch(
+                () => this.stateStore!.set(stateKey, newState, 300000), // 5 minute TTL
+                'Failed to update segment state',
+            )
+            .map(() => undefined);
+    }
+
+    /**
+	 * Wait for a remote node to complete segment processing
+	 */
+    private waitForRemoteSegment (segment: Segment, state: SegmentState): TaskEither<void> {
+        const maxWaitTime = this.config.segmentTimeout;
+        const checkInterval = 1000;
+        const startTime = Date.now();
+
+        const checkSegment = (): TaskEither<void> => this.source
+            .segmentExist(this.type, this.streamIndex, this.quality, segment.index)
+            .matchTask([
+                {
+                    predicate: (exists) => exists,
+                    run: () => {
+                        segment.value = Deferred.create<void>().resolve();
+
+                        return TaskEither.of(undefined);
+                    },
+                },
+                {
+                    predicate: () => (Date.now() - startTime) > maxWaitTime,
+                    run: () => TaskEither.error(
+                        createBadRequestError(`Timeout waiting for remote segment ${segment.index}`),
+                    ),
+                },
+                {
+                    predicate: () => true,
+                    run: () => TaskEither
+                        .tryCatch(() => new Promise((resolve) => setTimeout(resolve, checkInterval)))
+                        .chain(() => checkSegment()),
+                },
+            ]);
+
+        return checkSegment();
+    }
+
+    /**
+	 * Acquire distributed lock for segment processing
+	 */
+    private acquireSegmentLock (segmentIndex: number): TaskEither<Lock | null> {
+        if (!this.lockManager) {
+            return TaskEither.of(null);
+        }
+
+        const lockKey = `segment:${this.getStreamId()}:${segmentIndex}`;
+        const lockTTL = this.config.segmentTimeout * 2;
+
+        return TaskEither
+            .tryCatch(
+                () => this.lockManager!.tryAcquire(lockKey, lockTTL),
+                'Failed to acquire segment lock',
+            );
+    }
+
+    /**
+	 * Clean up distributed state on disposal
+	 */
+    private async cleanupDistributedState (): Promise<void> {
+        if (!this.stateStore) {
+            return;
+        }
+
+        try {
+            // Clean up segment states
+            const segmentKeys = await this.stateStore.keys(`segment:${this.getStreamId()}:*`);
+
+            for (const key of segmentKeys) {
+                await this.stateStore.delete(key);
+            }
+
+            // Clean up metrics
+            const metricsKey = `metrics:stream:${this.getStreamId()}`;
+
+            await this.stateStore.delete(metricsKey);
+        } catch (error) {
+            console.error('Failed to cleanup distributed state:', error);
+        }
+    }
+
+    /**
+	 * Publish metrics to distributed store
+	 */
+    private publishDistributedMetrics (event: StreamMetricsEvent): TaskEither<void> {
+        if (!this.stateStore) {
+            return TaskEither.of(undefined);
+        }
+
+        const metricsKey = `metrics:stream:${this.getStreamId()}`;
+
+        return TaskEither
+            .tryCatch(
+                () => this.stateStore!.set(metricsKey, event, 300000), // 5 minute TTL
+                'Failed to publish metrics',
+            )
+            .tap(() => {
+                if (this.eventBus) {
+                    return this.eventBus.publish('stream:metrics', event);
+                }
+            })
+            .map(() => undefined);
     }
 
     /**
@@ -518,6 +693,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         };
 
         this.emit('stream:metrics', metricsEvent);
+
+        // Publish to distributed store
+        void this.publishDistributedMetrics(metricsEvent).toResult();
     }
 
     /**
@@ -568,8 +746,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Start a timer to periodically emit metrics
-     */
+	 * Start a timer to periodically emit metrics
+	 */
     private startPeriodicMetrics (): void {
         if (this.config.metricsInterval <= 0) {
             return;
@@ -581,8 +759,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Get dynamic batch size based on hardware acceleration
-     */
+	 * Get dynamic batch size based on hardware acceleration
+	 */
     private getDynamicBatchSize (): number {
         const baseSize = this.maxSegmentBatchSize;
 
@@ -638,8 +816,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Fallback to software encoding while preserving the original optimized config
-     */
+	 * Fallback to software encoding while preserving the original optimized config
+	 */
     private fallbackToSoftwareEncoding (): void {
         if (this.optimisedAccel && this.config.enableHardwareAccelFallback && !this.hasFallenBackToSoftware) {
             this.hasFallenBackToSoftware = true;
@@ -969,21 +1147,37 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             return TaskEither.fromResult(() => initialSegment.value!.promise());
         }
 
-        return this.getTranscodeArgs(builder, segmentsToProcess)
-            .toTaskEither()
-            .chain((options) => this.source.getStreamDirectory(this.type, this.streamIndex, this.quality)
-                .map((outputDir) => ({
-                    options,
-                    outputDir,
-                })))
-            .chain(({ options, outputDir }) => this.executeTranscodeCommand(
-                initialSegment,
-                segmentsToProcess,
-                options,
-                outputDir,
-                priority,
-            ))
-            .chain(() => TaskEither.fromResult(() => initialSegment.value!.promise()));
+        return this.acquireSegmentLock(initialSegment.index)
+            .chain((lock) => {
+                if (!lock && this.lockManager) {
+                    return this.waitForRemoteSegment(initialSegment, {
+                        status: 'processing',
+                        processingNode: 'unknown',
+                        lastUpdated: Date.now(),
+                    });
+                }
+
+                return this.updateDistributedSegmentState(initialSegment.index, {
+                    status: 'processing',
+                    processingNode: this.nodeId,
+                })
+                    .chain(() => this.getTranscodeArgs(builder, segmentsToProcess)
+                        .toTaskEither()
+                        .chain((options) => this.source.getStreamDirectory(this.type, this.streamIndex, this.quality)
+                            .map((outputDir) => ({
+                                options,
+                                outputDir,
+                            })))
+                        .chain(({ options, outputDir }) => this.executeTranscodeCommand(
+                            initialSegment,
+                            segmentsToProcess,
+                            options,
+                            outputDir,
+                            priority,
+                            lock,
+                        )))
+                    .chain(() => TaskEither.fromResult(() => initialSegment.value!.promise()));
+            });
     }
 
     /**
@@ -995,9 +1189,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         options: FFMPEGOptions,
         outputDir: string,
         priority: number,
+        lock: Lock | null,
     ): TaskEither<void> {
         return TaskEither.tryCatch(
-            () => this.setupAndRunCommand(initialSegment, segments, options, outputDir, priority),
+            () => this.setupAndRunCommand(initialSegment, segments, options, outputDir, priority, lock),
             'Failed to execute transcode command',
         );
     }
@@ -1011,13 +1206,14 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         options: FFMPEGOptions,
         outputDir: string,
         priority: number,
+        lock: Lock | null,
     ): Promise<void> {
         return new Promise((resolve, reject) => {
             const command = this.createFfmpegCommand(options, outputDir);
             const job = this.createTranscodeJob(initialSegment, priority, command);
             const jobRange = this.createJobRange(initialSegment, segments);
 
-            this.setupCommandEventHandlers(command, job, jobRange, segments, resolve, reject);
+            this.setupCommandEventHandlers(command, job, jobRange, segments, lock, resolve, reject);
 
             this.emit('transcode:queued', job);
             this.jobRange.push(jobRange);
@@ -1074,6 +1270,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
      * @param job - The transcode job
      * @param jobRange - The job range
      * @param segments - The segments being processed
+     * @param lock - The distributed lock (if any)
      * @param resolve - Resolve function
      * @param reject - Reject function
      */
@@ -1082,6 +1279,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         job: TranscodeJob,
         jobRange: JobRange,
         segments: Segment[],
+        lock: Lock | null,
         resolve: () => void,
         reject: (error: Error) => void,
     ): void {
@@ -1103,6 +1301,11 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         command.on('progress', (progress) => {
             lastIndex = progress.segment;
             this.handleSegmentProgress(progress.segment, segments);
+
+            // Extend lock periodically
+            if (lock && lock.isValid()) {
+                void lock.extend(this.config.segmentTimeout * 2);
+            }
         });
 
         command.on('end', () => {
@@ -1112,6 +1315,20 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
             job.status = TranscodeStatus.PROCESSED;
             jobRange.status = JobRangeStatus.PROCESSED;
+
+            // Update distributed state for all processed segments
+            segments.forEach((segment) => {
+                void this.updateDistributedSegmentState(segment.index, {
+                    status: 'completed',
+                    processingNode: this.nodeId,
+                });
+            });
+
+            // Release lock
+            if (lock) {
+                void lock.release();
+            }
+
             this.emit('transcode:complete', job);
             this.emitMetrics();
             this.off('dispose', disposeHandler);
@@ -1119,10 +1336,10 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         });
 
         command.on('error', (err: Error) => {
-            this.handleTranscodeError(err, job, jobRange, segments, lastIndex, disposeHandler);
+            this.handleTranscodeError(err, job, jobRange, segments, lastIndex, lock, disposeHandler);
 
             if (this.shouldRetryWithFallback(err, segments[0].index)) {
-                this.retryWithFallback(segments[0], job, resolve, reject);
+                this.retryWithFallback(segments[0], job, lock, resolve, reject);
             } else {
                 this.emitMetrics();
                 reject(err);
@@ -1153,26 +1370,28 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Handle transcoding errors with potential hardware acceleration fallback
-     * @param err - The error that occurred
-     * @param job - The job that was processing
-     * @param jobRange - The job range that was processing
-     * @param segments - The segments that were being processed
-     * @param lastIndex - The last index processed
-     * @param disposeHandler - The dispose handler to call
-     */
+	 * Handle transcoding errors with potential hardware acceleration fallback
+	 * @param err - The error that occurred
+	 * @param job - The job that was processing
+	 * @param jobRange - The job range that was processing
+	 * @param segments - The segments that were being processed
+	 * @param lastIndex - The last index processed
+	 * @param lock - The distributed lock (if any)
+	 * @param disposeHandler - The dispose handler to call
+	 */
     private handleTranscodeError (
         err: Error,
         job: TranscodeJob,
         jobRange: JobRange,
         segments: Segment[],
         lastIndex: number,
+        lock: Lock | null,
         disposeHandler: () => void,
     ): void {
         try {
             const unprocessedSegments = segments.filter(
                 (segment) => segment.index > lastIndex &&
-                    segment.value?.state() === 'pending',
+					segment.value?.state() === 'pending',
             );
 
             let rejectedCount = 0;
@@ -1182,6 +1401,12 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                     if (segment.value && segment.value.state() === 'pending') {
                         segment.value.reject(new Error(err.message));
                         rejectedCount++;
+
+                        // Update distributed state
+                        void this.updateDistributedSegmentState(segment.index, {
+                            status: 'failed',
+                            processingNode: this.nodeId,
+                        });
                     }
                 } catch (segmentError) {
                     console.warn(`Failed to reject segment ${segment.index}:`, segmentError);
@@ -1193,6 +1418,11 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             job.status = TranscodeStatus.ERROR;
             jobRange.status = JobRangeStatus.ERROR;
 
+            // Release lock on error
+            if (lock) {
+                void lock.release();
+            }
+
             this.emit('transcode:error', {
                 job,
                 error: err,
@@ -1203,18 +1433,22 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             console.error('Error in handleTranscodeError:', handlingError);
             job.status = TranscodeStatus.ERROR;
             jobRange.status = JobRangeStatus.ERROR;
+
+            if (lock) {
+                void lock.release();
+            }
         }
     }
 
     /**
-     * Check if we should retry with fallback
-     * @param err - The error to check
-     * @param segmentIndex - The index of the segment
-     */
+	 * Check if we should retry with fallback
+	 * @param err - The error to check
+	 * @param segmentIndex - The index of the segment
+	 */
     private shouldRetryWithFallback (err: Error, segmentIndex: number): boolean {
         if (!this.config.enableHardwareAccelFallback ||
-            !this.optimisedAccel ||
-            this.hasFallenBackToSoftware) {
+			!this.optimisedAccel ||
+			this.hasFallenBackToSoftware) {
             return false;
         }
 
@@ -1228,15 +1462,17 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Retry transcoding with software fallback
-     * @param segment - The segment to retry
-     * @param originalJob - The original job
-     * @param resolve - Resolve function
-     * @param reject - Reject function
-     */
+	 * Retry transcoding with software fallback
+	 * @param segment - The segment to retry
+	 * @param originalJob - The original job
+	 * @param lock - The distributed lock (if any)
+	 * @param resolve - Resolve function
+	 * @param reject - Reject function
+	 */
     private retryWithFallback (
         segment: Segment,
         originalJob: TranscodeJob,
+        lock: Lock | null,
         resolve: () => void,
         reject: (error: Error) => void,
     ): void {
@@ -1247,6 +1483,11 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         const retryCount = (this.segmentRetries.get(segment.index) || 0) + 1;
 
         this.segmentRetries.set(segment.index, retryCount);
+
+        // Release lock before retry
+        if (lock) {
+            void lock.release();
+        }
 
         this.emit('transcode:fallback', {
             job: originalJob,
@@ -1267,22 +1508,22 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Update metrics on successful completion
-     * @param segmentCount - Number of segments processed
-     * @param processingTime - Time taken to process segments
-     */
+	 * Update metrics on successful completion
+	 * @param segmentCount - Number of segments processed
+	 * @param processingTime - Time taken to process segments
+	 */
     private updateMetricsOnSuccess (segmentCount: number, processingTime: number): void {
         this.metrics.totalJobsCompleted++;
 
         const totalJobs = this.metrics.totalJobsCompleted;
 
         this.metrics.averageProcessingTime =
-            (this.metrics.averageProcessingTime * (totalJobs - 1) + processingTime) / totalJobs;
+			(this.metrics.averageProcessingTime * (totalJobs - 1) + processingTime) / totalJobs;
     }
 
     /**
-     * Calculate the closest multiple of x to n
-     */
+	 * Calculate the closest multiple of x to n
+	 */
     private closestMultiple (n: number, x: number): number {
         if (x > n) {
             return x;
@@ -1295,8 +1536,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Load the quality of the stream
-     */
+	 * Load the quality of the stream
+	 */
     private loadQuality (): [AudioQuality | null, VideoQuality | null] {
         if (this.type === StreamType.AUDIO) {
             return [this.qualityService.parseAudioQuality(this.quality), null] as const;
@@ -1308,8 +1549,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Debounce the dispose method
-     */
+	 * Debounce the dispose method
+	 */
     private debounceDispose (): void {
         if (this.timer) {
             clearTimeout(this.timer);
@@ -1319,9 +1560,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Calculate distance from current encoders to a segment
-     * @param segmentIndex - The index of the segment
-     */
+	 * Calculate distance from current encoders to a segment
+	 * @param segmentIndex - The index of the segment
+	 */
     private getMinEncoderDistance (segmentIndex: number): number {
         const segment = this.segments.get(segmentIndex);
 
@@ -1333,8 +1574,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
         const distances = this.jobRange
             .filter((range) => range.status === JobRangeStatus.PROCESSING &&
-                range.start <= targetTime &&
-                targetTime <= range.start + range.end)
+				range.start <= targetTime &&
+				targetTime <= range.start + range.end)
             .map((range) => targetTime - range.start);
 
         if (distances.length === 0) {
@@ -1345,9 +1586,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Check if a segment is already scheduled for processing
-     * @param segmentIndex - The index of the segment
-     */
+	 * Check if a segment is already scheduled for processing
+	 * @param segmentIndex - The index of the segment
+	 */
     private isSegmentScheduled (segmentIndex: number): boolean {
         const segment = this.segments.get(segmentIndex);
 
@@ -1356,20 +1597,20 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         }
 
         return this.jobRange.some((range) => range.status === JobRangeStatus.PROCESSING &&
-            segment.start >= range.start &&
-            segment.start <= (range.start + range.end));
+			segment.start >= range.start &&
+			segment.start <= (range.start + range.end));
     }
 
     /**
-     * Check if hardware acceleration is being used
-     */
+	 * Check if hardware acceleration is being used
+	 */
     private isUsingHardwareAcceleration (): boolean {
         return Boolean(this.optimisedAccel) && !this.hasFallenBackToSoftware;
     }
 
     /**
-     * Get the current acceleration method
-     */
+	 * Get the current acceleration method
+	 */
     private getCurrentAccelerationMethod (): string {
         if (this.hasFallenBackToSoftware) {
             return 'software';
