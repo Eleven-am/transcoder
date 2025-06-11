@@ -389,6 +389,17 @@ export interface StreamConfig {
 	metricsInterval: number;
 }
 
+export interface FfmpegEventMap {
+	'start': {
+		command: string;
+	};
+	'progress': {
+		segment: number;
+	};
+	'end': void;
+	'error': Error;
+}
+
 /**
  * HLSController is the sole entry point for the HLS package.
  * It is responsible for managing the HLS transcoding process.
@@ -487,3 +498,67 @@ export declare class HLSController {
 }
 
 export declare function createRedisBackend(options: RedisDistributedBackendOptions): DistributedConfig;
+
+export declare class FfmpegCommand {
+	/**
+	 * Add input options to the command
+	 * @param options Array of input options
+	 */
+	inputOptions (options: string[]): FfmpegCommand;
+	
+	/**
+	 * Add output options to the command
+	 * @param options Array of output options
+	 */
+	outputOptions (options: string[]): FfmpegCommand;
+	
+	/**
+	 * Add video filters to the command
+	 * @param filters Video filter string
+	 */
+	videoFilters (filters: string): FfmpegCommand;
+	
+	/**
+	 * Set the output path
+	 * @param outputPath Path for the output file
+	 */
+	output (outputPath: string): FfmpegCommand;
+	
+	/**
+	 * Execute the FFmpeg command
+	 */
+	run (): void;
+	
+	/**
+	 * Kill the FFmpeg process
+	 * @param signal Signal to send to the process
+	 */
+	kill (signal: NodeJS.Signals = 'SIGKILL'): void;
+	
+	/**
+	 * Pipe the FFmpeg output to a stream rather than a file
+	 * @returns The stdout stream from the FFmpeg process
+	 */
+	pipe (): Readable;
+	
+	/**
+	 * Add an event listener for FFmpeg events
+	 * @param event The event name to listen for
+	 * @param listener The listener function to call when the event is emitted
+	 */
+	on<K extends keyof FfmpegEventMap & string> (event: K, listener: (args: FfmpegEventMap[K]) => void): this {
+		return super.on(event, listener);
+	}
+	
+	/**
+	 * Add a one-time event listener for FFmpeg events
+	 * @param event The event name to listen for
+	 * @param listener The listener function to call when the event is emitted
+	 */
+	once<K extends keyof FfmpegEventMap & string> (event: K, listener: (args: FfmpegEventMap[K]) => void): this {
+		return super.once(event, listener);
+	}
+}
+
+export declare function ffmpeg (inputPath: string): FfmpegCommand;
+
