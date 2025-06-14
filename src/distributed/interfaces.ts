@@ -1,157 +1,178 @@
-import { StreamType } from '../types';
+/**
+ * Core interfaces for distributed operation of the HLS transcoding system.
+ * These interfaces allow the system to work in both single-node (in-memory)
+ * and multi-node (distributed) configurations.
+ */
+
+import { TranscodeJob } from '../types';
 
 /**
- * Serializable transcode job that can be queued and processed by any node
+ * StateStore provides distributed key-value storage for shared state
+ * across multiple nodes. Used for client sessions, stream metadata, etc.
  */
-export interface DistributedTranscodeJob {
-    id: string;
-    priority: number;
-    createdAt: number;
+export interface StateStore {
 
-    // Source file information
-    filePath: string;
-    fileId: string;
-    streamType: StreamType;
-    streamIndex: number;
-    quality: string;
-    segmentIndex: number;
+    /**
+	 * Retrieve a value by key
+	 * @param key The key to retrieve
+	 * @returns The value or null if not found
+	 */
+    get<T>(key: string): Promise<T | null>;
 
-    // FFmpeg parameters (all serializable)
-    inputOptions: string[];
-    outputOptions: string[];
-    videoFilters?: string;
-    outputPath: string;
+    /**
+	 * Store a value with optional TTL
+	 * @param key The key to store
+	 * @param value The value to store
+	 * @param ttl Time to live in milliseconds (optional)
+	 */
+    set<T>(key: string, value: T, ttl?: number): Promise<void>;
 
-    // Segment range being processed
-    segmentRange: {
-        start: number;
-        end: number;
-    };
+    /**
+	 * Delete a key
+	 * @param key The key to delete
+	 */
+    delete(key: string): Promise<void>;
+
+    /**
+	 * Atomically increment a numeric value
+	 * @param key The key to increment
+	 * @param by Amount to increment by (default: 1)
+	 * @returns The new value after increment
+	 */
+    increment(key: string, by?: number): Promise<number>;
+
+    /**
+	 * Get multiple keys at once
+	 * @param keys Array of keys to retrieve
+	 * @returns Map of key to value (null if key doesn't exist)
+	 */
+    getMany<T>(keys: string[]): Promise<Map<string, T | null>>;
+
+    /**
+	 * List keys matching a pattern
+	 * @param pattern Pattern to match (e.g., "client:*")
+	 * @returns Array of matching keys
+	 */
+    keys(pattern: string): Promise<string[]>;
 }
 
 /**
- * Coordinates segment processing state across local and distributed environments
+ * JobQueue provides distributed work queue functionality for
+ * coordinating transcode jobs across multiple nodes.
  */
-export interface SegmentCoordinator {
-
-    /**
-	 * Wait for a specific segment to complete processing
-	 * @param segmentId Unique identifier for the segment
-	 * @param timeout Maximum time to wait in milliseconds
-	 * @returns Promise that resolves when segment is complete
-	 */
-    waitForSegment(segmentId: string, timeout: number): Promise<void>;
-
-    /**
-	 * Mark a segment as currently being processed
-	 * @param segmentId Unique identifier for the segment
-	 * @param nodeId ID of the node processing the segment
-	 */
-    markSegmentProcessing(segmentId: string, nodeId: string): Promise<void>;
-
-    /**
-	 * Mark a segment as completed
-	 * @param segmentId Unique identifier for the segment
-	 */
-    markSegmentComplete(segmentId: string): Promise<void>;
-
-    /**
-	 * Mark a segment as failed
-	 * @param segmentId Unique identifier for the segment
-	 * @param error Error message
-	 */
-    markSegmentFailed(segmentId: string, error: string): Promise<void>;
-
-    /**
-	 * Check if a segment is currently being processed
-	 * @param segmentId Unique identifier for the segment
-	 * @returns Promise resolving to true if segment is being processed
-	 */
-    isSegmentProcessing(segmentId: string): Promise<boolean>;
-
-    /**
-	 * Check if a segment has completed processing
-	 * @param segmentId Unique identifier for the segment
-	 * @returns Promise resolving to true if segment is complete
-	 */
-    isSegmentComplete(segmentId: string): Promise<boolean>;
-
-    /**
-	 * Get the processing status of a segment
-	 * @param segmentId Unique identifier for the segment
-	 * @returns Promise resolving to segment status
-	 */
-    getSegmentStatus(segmentId: string): Promise<SegmentStatus>;
-
-    /**
-	 * Clean up resources for a stream
-	 * @param streamId Unique identifier for the stream
-	 */
-    cleanup(streamId: string): Promise<void>;
-}
-
-/**
- * Queue for distributing transcode jobs across nodes
- */
-export interface TranscodeJobQueue {
+export interface JobQueue {
 
     /**
 	 * Add a job to the queue
 	 * @param job The transcode job to queue
 	 */
-    push(job: DistributedTranscodeJob): Promise<void>;
+    push(job: TranscodeJob): Promise<void>;
 
     /**
-	 * Get the next job from the queue
-	 * @param nodeId ID of the node requesting the job
-	 * @returns Promise resolving to the next job or null if queue is empty
+	 * Retrieve the next job from the queue
+	 * @param timeout How long to wait for a job in milliseconds
+	 * @returns The next job or null if timeout reached
 	 */
-    pop(nodeId: string): Promise<DistributedTranscodeJob | null>;
+    pop(timeout?: number): Promise<TranscodeJob | null>;
 
     /**
-	 * Mark a job as completed
-	 * @param jobId The ID of the completed job
+	 * Return a job to the queue (e.g., on failure)
+	 * @param job The job to requeue
 	 */
-    complete(jobId: string): Promise<void>;
-
-    /**
-	 * Mark a job as failed and optionally requeue it
-	 * @param jobId The ID of the failed job
-	 * @param error Error message
-	 * @param requeue Whether to requeue the job for retry
-	 */
-    fail(jobId: string, error: string, requeue?: boolean): Promise<void>;
+    requeue(job: TranscodeJob): Promise<void>;
 
     /**
 	 * Get the current queue size
-	 * @returns Promise resolving to the number of jobs in queue
+	 * @returns Number of jobs in queue
 	 */
     size(): Promise<number>;
+}
+
+/**
+ * Lock represents an acquired distributed lock
+ */
+export interface Lock {
 
     /**
-	 * Get jobs currently being processed
-	 * @returns Promise resolving to array of job IDs being processed
+	 * Release the lock
 	 */
-    getProcessing(): Promise<string[]>;
+    release(): Promise<void>;
+
+    /**
+	 * Extend the lock TTL
+	 * @param ttl New TTL in milliseconds
+	 */
+    extend(ttl: number): Promise<void>;
+
+    /**
+	 * Check if the lock is still valid
+	 * @returns True if lock is still held
+	 */
+    isValid(): Promise<boolean>;
 }
 
 /**
- * Status of a segment in the processing pipeline
+ * LockManager provides distributed locking to ensure
+ * only one node processes a resource at a time.
  */
-export enum SegmentStatus {
-    PENDING = 'pending',
-    PROCESSING = 'processing',
-    COMPLETED = 'completed',
-    FAILED = 'failed'
+export interface LockManager {
+
+    /**
+	 * Acquire an exclusive lock on a resource
+	 * @param resource Resource identifier (e.g., "segment:fileId:v:0:720p:5")
+	 * @param ttl Lock timeout in milliseconds
+	 * @returns The acquired lock
+	 * @throws Error if unable to acquire lock
+	 */
+    acquire(resource: string, ttl: number): Promise<Lock>;
+
+    /**
+	 * Try to acquire a lock without blocking
+	 * @param resource Resource identifier
+	 * @param ttl Lock timeout in milliseconds
+	 * @returns The lock if acquired, null otherwise
+	 */
+    tryAcquire(resource: string, ttl: number): Promise<Lock | null>;
 }
 
 /**
- * Information about a segment's processing state
+ * EventBus provides pub/sub messaging across nodes for
+ * coordinating events like client updates, stream lifecycle, etc.
  */
-export interface SegmentInfo {
-    status: SegmentStatus;
-    nodeId?: string;
-    startedAt?: number;
-    completedAt?: number;
-    error?: string;
+export interface EventBus {
+
+    /**
+	 * Publish an event to all subscribe nodes
+	 * @param channel Channel name (e.g., "client:activity")
+	 * @param event Event data
+	 */
+    publish(channel: string, event: any): Promise<void>;
+
+    /**
+	 * Subscribe to events on a channel
+	 * @param channel Channel name
+	 * @param handler Function to handle received events
+	 */
+    subscribe(channel: string, handler: (event: any) => void): Promise<void>;
+
+    /**
+	 * Unsubscribe from a channel
+	 * @param channel Channel name
+	 */
+    unsubscribe(channel: string): Promise<void>;
+
+    /**
+	 * Unsubscribe from all channels
+	 */
+    unsubscribeAll(): Promise<void>;
+}
+
+/**
+ * Configuration for distributed backends
+ */
+export interface DistributedConfig {
+    stateStore?: StateStore;
+    jobQueue?: JobQueue;
+    lockManager?: LockManager;
+    eventBus?: EventBus;
 }

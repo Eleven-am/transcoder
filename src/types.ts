@@ -1,7 +1,8 @@
 import { ReadStream } from 'fs';
 
 import { DatabaseConnector } from './databaseConnector';
-import { SegmentCoordinator, TranscodeJobQueue } from './distributed';
+import { DistributedConfig } from './distributed';
+import { FfmpegCommand } from './ffmpeg';
 
 export interface Stream {
     codec_name: string;
@@ -116,14 +117,7 @@ export interface HLSManagerOptions {
     videoQualities?: VideoQualityEnum[];
     audioQualities?: AudioQualityEnum[];
     config?: Partial<StreamConfig>;
-    inactivityCheckFrequency?: number;
-    unusedStreamDebounceDelay?: number;
-    inactivityThreshold?: number;
-    maxConcurrentJobs?: number;
-
-    // Optional distributed options
-    segmentCoordinator?: SegmentCoordinator;
-    jobQueue?: TranscodeJobQueue;
+    distributed?: DistributedConfig;
 }
 
 export interface StreamConfig {
@@ -221,6 +215,15 @@ export interface ClientSession {
     status: TranscodeType;
     audioProfile: AudioQuality;
     videoProfile: VideoQuality;
+}
+
+export interface TranscodeJob {
+    id: string;
+    start: number;
+    priority: number;
+    createdAt: number;
+    status: TranscodeStatus;
+    process: FfmpegCommand;
 }
 
 export interface SegmentStream {
