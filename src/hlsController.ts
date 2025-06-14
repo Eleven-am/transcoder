@@ -392,11 +392,7 @@ export class HLSController {
                 () => this.#stateStore.keys('stream:info:*'),
                 'Failed to get stream keys',
             )
-            .chain((keys) => TaskEither
-                .tryCatch(
-                    () => this.#stateStore.getMany<any>(keys),
-                    'Failed to get stream info',
-                ))
+            .fromPromise((keys) => this.#stateStore.getMany<any>(keys))
             .map((streamsMap) => {
                 // Update local knowledge of distributed streams
                 for (const [key, streamInfo] of streamsMap.entries()) {
