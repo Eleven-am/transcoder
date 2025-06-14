@@ -1,10 +1,10 @@
-import * as path from 'path';
+import * as path from 'node:path';
 import { Readable } from 'stream';
 
-import { createBadRequestError, createNotFoundError, Deferred, Either, Result, sortBy, TaskEither } from '@eleven-am/fp';
+import { createNotFoundError, Result, sortBy, TaskEither } from '@eleven-am/fp';
 
-import { EventBus, Lock, LockManager, StateStore } from './distributed';
-import ffmpeg, { FfmpegCommand } from './ffmpeg';
+import { DistributedTranscodeJob, SegmentCoordinator, SegmentStatus } from './distributed';
+import ffmpeg from './ffmpeg';
 import { HardwareAccelerationDetector } from './hardwareAccelerationDetector';
 import { MediaSource } from './mediaSource';
 import { MetadataService } from './metadataService';
@@ -22,54 +22,31 @@ import {
     StreamMetricsEvent,
     StreamType,
     SubtitleInfo,
-    TranscodeJob,
-    TranscodeStatus,
-    VideoInfo,
     VideoQuality,
     VideoQualityEnum,
 } from './types';
 import { ExtendedEventEmitter } from './utils';
 
+
 interface Segment {
     index: number;
     start: number;
     duration: number;
-    value: Deferred<void> | null;
 }
 
 interface StreamEventMap {
-    'transcode:complete': TranscodeJob;
-    'transcode:queued': TranscodeJob;
-    'transcode:error': { job: TranscodeJob, error: Error };
-    'transcode:start': TranscodeJob;
-    'transcode:fallback': { job: TranscodeJob, from: string, to: string };
+    'transcode:complete': DistributedTranscodeJob;
+    'transcode:queued': DistributedTranscodeJob;
+    'transcode:error': { job: DistributedTranscodeJob, error: Error };
+    'transcode:start': DistributedTranscodeJob;
+    'transcode:fallback': { job: DistributedTranscodeJob, from: string, to: string };
     'stream:metrics': StreamMetricsEvent;
     'dispose': { id: string };
 }
 
-enum JobRangeStatus {
-    PROCESSING,
-    PROCESSED,
-    ERROR,
-}
-
-interface JobRange {
-    start: number;
-    end: number;
-    status: JobRangeStatus;
-}
-
-type ArgsBuilder = (segments: string) => Either<FFMPEGOptions>;
-
 interface DetailedVideoQuality extends VideoQuality {
     width: number;
     height: number;
-}
-
-interface SegmentState {
-    status: 'pending' | 'processing' | 'completed' | 'failed';
-    processingNode?: string;
-    lastUpdated: number;
 }
 
 export class Stream extends ExtendedEventEmitter<StreamEventMap> {
@@ -90,8 +67,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     private readonly audioQuality: AudioQuality | null;
 
     private readonly segments: Map<number, Segment>;
-
-    private readonly jobRange: JobRange[];
 
     private readonly config: StreamConfig;
 
@@ -122,9 +97,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         private readonly hwDetector: HardwareAccelerationDetector,
         private readonly optimisedAccel: HardwareAccelerationConfig | null,
         config: Partial<StreamConfig>,
-        private readonly stateStore?: StateStore,
-        private readonly lockManager?: LockManager,
-        private readonly eventBus?: EventBus,
+        private readonly segmentCoordinator: SegmentCoordinator,
     ) {
         super();
 
@@ -139,7 +112,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         this.segments = this.buildSegments();
         this.videoQuality = vQ;
         this.audioQuality = aQ;
-        this.jobRange = [];
         this.timer = null;
         this.hasFallenBackToSoftware = false;
         this.streamCreatedAt = Date.now();
@@ -159,21 +131,19 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Create a new stream
-     * @param quality - The quality of the stream
-     * @param type - The type of the stream (audio or video)
-     * @param streamIndex - The index of the stream
-     * @param source - The media source
-     * @param maxSegmentBatchSize - The maximum number of segments to process at once
-     * @param qualityService - The quality service
-     * @param metadataService - The metadata service
-     * @param hwDetector - The hardware acceleration detector
-     * @param hwAccel - The hardware acceleration configuration
-     * @param config - The stream configuration
-     * @param stateStore - The distributed state store
-     * @param lockManager - The distributed lock manager
-     * @param eventBus - The distributed event bus
-     */
+	 * Create a new stream
+	 * @param quality - The quality of the stream
+	 * @param type - The type of the stream (audio or video)
+	 * @param streamIndex - The index of the stream
+	 * @param source - The media source
+	 * @param maxSegmentBatchSize - The maximum number of segments to process at once
+	 * @param qualityService - The quality service
+	 * @param metadataService - The metadata service
+	 * @param hwDetector - The hardware acceleration detector
+	 * @param hwAccel - The hardware acceleration configuration
+	 * @param config - The stream configuration
+	 * @param segmentCoordinator - The segment coordinator for distributed coordination
+	 */
     static create (
         quality: string,
         type: StreamType,
@@ -185,9 +155,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         hwDetector: HardwareAccelerationDetector,
         hwAccel: HardwareAccelerationConfig | null,
         config: Partial<StreamConfig>,
-        stateStore?: StateStore,
-        lockManager?: LockManager,
-        eventBus?: EventBus,
+        segmentCoordinator: SegmentCoordinator,
     ): TaskEither<Stream> {
         return TaskEither
             .fromBind({
@@ -205,29 +173,27 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                 hwDetector,
                 optimisedAccel,
                 config,
-                stateStore,
-                lockManager,
-                eventBus,
+                segmentCoordinator,
             ))
             .chain((stream) => stream.initialise());
     }
 
     /**
-    * Get the stream ID
-    * @param fileId - The file ID
-    * @param type - The type of the stream (audio or video)
-    * @param quality - The quality of the stream
-    * @param streamIndex - The index of the stream
-    */
+	 * Get the stream ID
+	 * @param fileId - The file ID
+	 * @param type - The type of the stream (audio or video)
+	 * @param quality - The quality of the stream
+	 * @param streamIndex - The index of the stream
+	 */
     static getStreamId (fileId: string, type: StreamType, quality: string, streamIndex: number): string {
         return `${fileId}:${type}:${streamIndex}:${quality}`;
     }
 
     /**
-    * Extract subtitle from a media source and convert to WebVTT
-    * @param mediaSource - The media source
-    * @param streamIndex - The index of the subtitle stream
-    */
+	 * Extract subtitle from a media source and convert to WebVTT
+	 * @param mediaSource - The media source
+	 * @param streamIndex - The index of the subtitle stream
+	 */
     static getVTTSubtitle (mediaSource: MediaSource, streamIndex: number): Promise<NodeJS.ReadableStream> {
         return this.runFFMPEGCommand(
             [
@@ -337,20 +303,20 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Builds the transcode command for the stream
+	 * Builds the transcode command for the stream using distributed coordination
 	 * @param segmentIndex - The index of the segment
 	 * @param priority - The priority of the segment
 	 */
     buildTranscodeCommand (segmentIndex: number, priority: number): TaskEither<void> {
         this.debounceDispose();
 
+        const segmentId = this.getSegmentId(segmentIndex);
+
         return TaskEither
             .fromBind({
-                distance: TaskEither.of(this.getMinEncoderDistance(segmentIndex)),
                 exists: this.source.segmentExist(this.type, this.streamIndex, this.quality, segmentIndex),
-                segment: TaskEither.fromNullable(this.segments.get(segmentIndex)),
-                isScheduled: TaskEither.of(this.isSegmentScheduled(segmentIndex)),
-                distributedState: this.getDistributedSegmentState(segmentIndex),
+                segmentStatus: TaskEither.tryCatch(() => this.segmentCoordinator.getSegmentStatus(segmentId)),
+                isProcessing: TaskEither.tryCatch(() => this.segmentCoordinator.isSegmentProcessing(segmentId)),
             })
             .matchTask([
                 {
@@ -358,25 +324,20 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
                     run: () => TaskEither.of(undefined),
                 },
                 {
-                    predicate: ({ distributedState }) => distributedState?.status === 'processing' &&
-						distributedState.processingNode !== this.nodeId,
-                    run: ({ segment, distributedState }) => this.waitForRemoteSegment(segment, distributedState!),
+                    predicate: ({ segmentStatus }) => segmentStatus === SegmentStatus.COMPLETED,
+                    run: () => TaskEither.of(undefined),
                 },
                 {
-                    predicate: ({ isScheduled, distance, segment }) => isScheduled &&
-						distance <= this.config.maxEncoderDistance &&
-						segment.value?.state() !== 'rejected',
-                    run: ({ segment }) => TaskEither
-                        .fromResult(() => segment.value!.promise())
-                        .timed(this.config.segmentTimeout, `Timed out waiting for segment ${segment.index}`),
+                    predicate: ({ isProcessing }) => isProcessing,
+                    run: () => TaskEither.tryCatch(() => this.segmentCoordinator.waitForSegment(segmentId, this.config.segmentTimeout)),
                 },
                 {
                     predicate: () => this.type === StreamType.AUDIO,
-                    run: ({ segment }) => this.buildAudioTranscodeOptions(segment, priority),
+                    run: () => this.buildAudioTranscodeJob(segmentIndex, priority),
                 },
                 {
                     predicate: () => this.type === StreamType.VIDEO,
-                    run: ({ segment }) => this.buildVideoTranscodeOptions(segment, priority),
+                    run: () => this.buildVideoTranscodeJob(segmentIndex, priority),
                 },
             ]);
     }
@@ -464,21 +425,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	 * Dispose of the stream
 	 */
     dispose (): Promise<Result<void>> {
-        this.segments.forEach((segment) => {
-            if (segment.value?.state() === 'pending') {
-                segment.value.reject(new Error('Stream disposed'));
-            }
-        });
-
         this.cachedHwOptions.clear();
         this.segmentRetries.clear();
-
-
-        this.jobRange.forEach((range) => {
-            if (range.status === JobRangeStatus.PROCESSING) {
-                range.status = JobRangeStatus.ERROR;
-            }
-        });
 
         if (this.timer) {
             clearTimeout(this.timer);
@@ -488,16 +436,15 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         }
 
         // Clean up distributed state
-        if (this.stateStore) {
-            void this.cleanupDistributedState();
-        }
+        void this.segmentCoordinator.cleanup(this.getStreamId()).catch((error) => {
+            console.warn(`Failed to cleanup segment coordinator for stream ${this.getStreamId()}:`, error);
+        });
 
         this.emit('dispose', { id: this.getStreamId() });
 
         return this.source.deleteTempFiles()
             .map(() => {
                 this.segments.clear();
-                this.jobRange.length = 0;
                 this.timer = null;
                 this.metricsTimer = null;
                 this.removeAllListeners();
@@ -506,160 +453,165 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Get distributed segment state
+	 * Get segment ID for distributed coordination
 	 */
-    private getDistributedSegmentState (segmentIndex: number): TaskEither<SegmentState | null> {
-        if (!this.stateStore) {
-            return TaskEither.of(null);
-        }
-
-        const stateKey = `segment:${this.getStreamId()}:${segmentIndex}`;
-
-        return TaskEither
-            .tryCatch(
-                () => this.stateStore!.get<SegmentState>(stateKey),
-                'Failed to get segment state',
-            );
+    private getSegmentId (segmentIndex: number): string {
+        return `${this.getStreamId()}:${segmentIndex}`;
     }
 
     /**
-	 * Update distributed segment state
+	 * Build audio transcode job for distributed processing
+	 * @param segmentIndex - The index of the segment
+	 * @param priority - The priority of the segment
 	 */
-    private updateDistributedSegmentState (segmentIndex: number, state: Partial<SegmentState>): TaskEither<void> {
-        if (!this.stateStore) {
-            return TaskEither.of(undefined);
+    private buildAudioTranscodeJob (segmentIndex: number, priority: number): TaskEither<void> {
+        const segment = this.segments.get(segmentIndex);
+
+        if (!segment) {
+            return TaskEither.error(createNotFoundError(`Segment ${segmentIndex} not found`));
         }
 
-        const stateKey = `segment:${this.getStreamId()}:${segmentIndex}`;
-        const newState: SegmentState = {
-            status: state.status || 'pending',
-            processingNode: state.processingNode || this.nodeId,
-            lastUpdated: Date.now(),
-        };
+        const segmentId = this.getSegmentId(segmentIndex);
 
-        return TaskEither
-            .tryCatch(
-                () => this.stateStore!.set(stateKey, newState, 300000), // 5 minute TTL
-                'Failed to update segment state',
-            )
-            .map(() => undefined);
-    }
+        // Mark segment as processing
+        return TaskEither.tryCatch(() => this.segmentCoordinator.markSegmentProcessing(segmentId, this.nodeId))
+            .chain(() => this.source.getStreamDirectory(this.type, this.streamIndex, this.quality))
+            .map((outputDir) => {
+                const outputOptions = this.audioQuality?.value === AudioQualityEnum.ORIGINAL
+                    ? [
+                        '-map',
+                        `0:a:${this.streamIndex}`,
+                        '-c:a',
+                        'copy',
+                        '-vn',
+                    ]
+                    : [
+                        '-map',
+                        `0:a:${this.streamIndex}`,
+                        '-c:a',
+                        'aac',
+                        '-ac',
+                        '2',
+                        '-b:a',
+                        '128k',
+                        '-vn',
+                    ];
 
-    /**
-	 * Wait for a remote node to complete segment processing
-	 */
-    private waitForRemoteSegment (segment: Segment, state: SegmentState): TaskEither<void> {
-        const maxWaitTime = this.config.segmentTimeout;
-        const checkInterval = 1000;
-        const startTime = Date.now();
-
-        const checkSegment = (): TaskEither<void> => this.source
-            .segmentExist(this.type, this.streamIndex, this.quality, segment.index)
-            .matchTask([
-                {
-                    predicate: (exists) => exists,
-                    run: () => {
-                        segment.value = Deferred.create<void>().resolve();
-
-                        return TaskEither.of(undefined);
+                const job: DistributedTranscodeJob = {
+                    id: `job-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+                    priority,
+                    createdAt: Date.now(),
+                    filePath: this.source.getFilePath(),
+                    fileId: this.metadata.id,
+                    streamType: this.type,
+                    streamIndex: this.streamIndex,
+                    quality: this.quality,
+                    segmentIndex,
+                    inputOptions: ['-nostats', '-hide_banner', '-loglevel', 'warning'],
+                    outputOptions,
+                    outputPath: path.join(outputDir, `segment-${segmentIndex}.ts`),
+                    segmentRange: {
+                        start: segment.start,
+                        end: segment.start + segment.duration,
                     },
-                },
-                {
-                    predicate: () => (Date.now() - startTime) > maxWaitTime,
-                    run: () => TaskEither.error(
-                        createBadRequestError(`Timeout waiting for remote segment ${segment.index}`),
-                    ),
-                },
-                {
-                    predicate: () => true,
-                    run: () => TaskEither
-                        .tryCatch(() => new Promise((resolve) => setTimeout(resolve, checkInterval)))
-                        .chain(() => checkSegment()),
-                },
-            ]);
+                };
 
-        return checkSegment();
+                this.emit('transcode:queued', job);
+                this.metrics.totalJobsStarted++;
+            });
     }
 
     /**
-	 * Acquire distributed lock for segment processing
+	 * Build video transcode job for distributed processing
+	 * @param segmentIndex - The index of the segment
+	 * @param priority - The priority of the segment
 	 */
-    private acquireSegmentLock (segmentIndex: number): TaskEither<Lock | null> {
-        if (!this.lockManager) {
-            return TaskEither.of(null);
+    private buildVideoTranscodeJob (segmentIndex: number, priority: number): TaskEither<void> {
+        const segment = this.segments.get(segmentIndex);
+        const video = this.metadata.videos[this.streamIndex];
+
+        if (!segment || !video) {
+            return TaskEither.error(createNotFoundError(`Segment ${segmentIndex} or video stream not found`));
         }
 
-        const lockKey = `segment:${this.getStreamId()}:${segmentIndex}`;
-        const lockTTL = this.config.segmentTimeout * 2;
+        const segmentId = this.getSegmentId(segmentIndex);
 
-        return TaskEither
-            .tryCatch(
-                () => this.lockManager!.tryAcquire(lockKey, lockTTL),
-                'Failed to acquire segment lock',
-            );
-    }
+        // Mark segment as processing
+        return TaskEither.tryCatch(() => this.segmentCoordinator.markSegmentProcessing(segmentId, this.nodeId))
+            .chain(() => this.source.getStreamDirectory(this.type, this.streamIndex, this.quality))
+            .map((outputDir) => {
+                let inputOptions = ['-nostats', '-hide_banner', '-loglevel', 'warning'];
+                let outputOptions: string[];
+                let videoFilters: string | undefined;
 
-    /**
-	 * Clean up distributed state on disposal
-	 */
-    private async cleanupDistributedState (): Promise<void> {
-        if (!this.stateStore) {
-            return;
-        }
+                if (this.videoQuality?.value === VideoQualityEnum.ORIGINAL) {
+                    outputOptions = [
+                        '-map',
+                        `0:v:${this.streamIndex}`,
+                        '-c:v',
+                        'copy',
+                        '-an',
+                    ];
+                } else {
+                    const detailedQuality = this.buildVideoQuality(this.videoQuality!.value);
+                    const codec: CodecType = video.codec.includes('hevc') || video.codec.includes('h265')
+                        ? 'h265'
+                        : 'h264';
 
-        try {
-            // Clean up segment states
-            const segmentKeys = await this.stateStore.keys(`segment:${this.getStreamId()}:*`);
+                    const hwOptions = this.getCachedHardwareOptions(
+                        detailedQuality.width,
+                        detailedQuality.height,
+                        codec,
+                    );
 
-            for (const key of segmentKeys) {
-                await this.stateStore.delete(key);
-            }
-
-            // Clean up metrics
-            const metricsKey = `metrics:stream:${this.getStreamId()}`;
-
-            await this.stateStore.delete(metricsKey);
-        } catch (error) {
-            console.error('Failed to cleanup distributed state:', error);
-        }
-    }
-
-    /**
-	 * Publish metrics to distributed store
-	 */
-    private publishDistributedMetrics (event: StreamMetricsEvent): TaskEither<void> {
-        if (!this.stateStore) {
-            return TaskEither.of(undefined);
-        }
-
-        const metricsKey = `metrics:stream:${this.getStreamId()}`;
-
-        return TaskEither
-            .tryCatch(
-                () => this.stateStore!.set(metricsKey, event, 300000), // 5 minute TTL
-                'Failed to publish metrics',
-            )
-            .tap(() => {
-                if (this.eventBus) {
-                    return this.eventBus.publish('stream:metrics', event);
+                    inputOptions = [...inputOptions, ...hwOptions.inputOptions];
+                    videoFilters = hwOptions.videoFilters;
+                    outputOptions = [
+                        '-map',
+                        `0:v:${this.streamIndex}`,
+                        '-bufsize',
+                        `${detailedQuality.maxBitrate * 5}`,
+                        '-b:v',
+                        `${detailedQuality.averageBitrate}`,
+                        '-maxrate',
+                        `${detailedQuality.maxBitrate}`,
+                        '-forced-idr',
+                        '1',
+                        ...hwOptions.outputOptions,
+                        '-an',
+                    ];
                 }
-            })
-            .map(() => undefined);
+
+                const job: DistributedTranscodeJob = {
+                    id: `job-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+                    priority,
+                    createdAt: Date.now(),
+                    filePath: this.source.getFilePath(),
+                    fileId: this.metadata.id,
+                    streamType: this.type,
+                    streamIndex: this.streamIndex,
+                    quality: this.quality,
+                    segmentIndex,
+                    inputOptions,
+                    outputOptions,
+                    videoFilters,
+                    outputPath: path.join(outputDir, `segment-${segmentIndex}.ts`),
+                    segmentRange: {
+                        start: segment.start,
+                        end: segment.start + segment.duration,
+                    },
+                };
+
+                this.emit('transcode:queued', job);
+                this.metrics.totalJobsStarted++;
+            });
     }
 
     /**
-     * Generate and emit comprehensive stream metrics
-     */
+	 * Generate and emit comprehensive stream metrics
+	 */
     private emitMetrics (): void {
         this.lastActivityAt = Date.now();
-
-        const segmentStates = this.calculateSegmentStates();
-
-        const avgSegmentDuration = this.metadata.duration / this.segments.size;
-        const remainingSegments = segmentStates.unstarted + segmentStates.pending;
-        const estimatedTimeRemaining = remainingSegments > 0 && this.metrics.averageProcessingTime > 0
-            ? remainingSegments * this.metrics.averageProcessingTime
-            : null;
 
         const metricsEvent: StreamMetricsEvent = {
             streamId: this.getStreamId(),
@@ -676,16 +628,14 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
             hasFallenBackToSoftware: this.hasFallenBackToSoftware,
 
             totalSegments: this.segments.size,
-            segmentsCompleted: segmentStates.completed,
-            segmentsPending: segmentStates.pending,
-            segmentsFailed: segmentStates.failed,
-            segmentsUnstarted: segmentStates.unstarted,
+            segmentsCompleted: 0,
+            segmentsPending: 0,
+            segmentsFailed: 0,
+            segmentsUnstarted: this.segments.size,
 
-            currentJobsActive: this.jobRange
-                .filter((range) => range.status === JobRangeStatus.PROCESSING)
-                .length,
-            averageSegmentDuration: avgSegmentDuration,
-            estimatedTimeRemaining,
+            currentJobsActive: 0,
+            averageSegmentDuration: this.metadata.duration / this.segments.size,
+            estimatedTimeRemaining: null,
 
             streamCreatedAt: this.streamCreatedAt,
             lastActivityAt: this.lastActivityAt,
@@ -693,56 +643,16 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         };
 
         this.emit('stream:metrics', metricsEvent);
-
-        // Publish to distributed store
-        void this.publishDistributedMetrics(metricsEvent).toResult();
     }
 
     /**
-     * Calculate current segment states
-     */
-    private calculateSegmentStates (): {
-        completed: number;
-        pending: number;
-        failed: number;
-        unstarted: number;
-    } {
-        let completed = 0;
-        let pending = 0;
-        let failed = 0;
-        let unstarted = 0;
-
-        this.segments.forEach((segment) => {
-            const state = segment.value?.state();
-
-            if (state === 'fulfilled') {
-                completed++;
-            } else if (state === 'pending') {
-                pending++;
-            } else if (state === 'rejected') {
-                failed++;
-            } else {
-                unstarted++;
-            }
-        });
-
-        return { completed,
-            pending,
-            failed,
-            unstarted };
-    }
-
-    /**
-     * Initialize the stream
-     */
+	 * Initialize the stream
+	 */
     private initialise (): TaskEither<Stream> {
-        return this.checkSegmentsStatus()
-            .map(() => {
-                this.emitMetrics();
-                this.startPeriodicMetrics();
+        this.emitMetrics();
+        this.startPeriodicMetrics();
 
-                return this;
-            });
+        return TaskEither.of(this);
     }
 
     /**
@@ -759,25 +669,12 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-	 * Get dynamic batch size based on hardware acceleration
+	 * Get cached hardware acceleration options
+	 * Uses optimisedAccel unless we've fallen back to software
+	 * @param width - Video width
+	 * @param height - Video height
+	 * @param codec - Codec type
 	 */
-    private getDynamicBatchSize (): number {
-        const baseSize = this.maxSegmentBatchSize;
-
-        if (this.isUsingHardwareAcceleration()) {
-            return Math.min(baseSize * 2, 200);
-        }
-
-        return Math.min(baseSize, 50);
-    }
-
-    /**
-     * Get cached hardware acceleration options
-     * Uses optimisedAccel unless we've fallen back to software
-     * @param width - Video width
-     * @param height - Video height
-     * @param codec - Codec type
-     */
     private getCachedHardwareOptions (width: number, height: number, codec: CodecType): FFMPEGOptions {
         const hwConfigToUse = this.hasFallenBackToSoftware ? null : this.optimisedAccel;
         const key = `${width}x${height}-${codec}-${hwConfigToUse?.method || 'software'}`;
@@ -797,152 +694,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
     }
 
     /**
-     * Check if an error is related to hardware acceleration
-     * @param err - The error to check
-     */
-    private isHardwareAccelerationError (err: Error): boolean {
-        const message = err.message.toLowerCase();
-
-        return [
-            'device creation failed',
-            'hardware device setup failed',
-            'nvenc',
-            'vaapi',
-            'qsv',
-            'videotoolbox',
-            'cuda',
-            'hardware acceleration',
-        ].some((str) => message.includes(str));
-    }
-
-    /**
-	 * Fallback to software encoding while preserving the original optimized config
+	 * Build the segments for this stream
 	 */
-    private fallbackToSoftwareEncoding (): void {
-        if (this.optimisedAccel && this.config.enableHardwareAccelFallback && !this.hasFallenBackToSoftware) {
-            this.hasFallenBackToSoftware = true;
-            this.cachedHwOptions.clear();
-            this.metrics.fallbacksToSoftware++;
-            this.metrics.hardwareAccelUsed = false;
-        }
-    }
-
-    /**
-     * Get the segment for this stream (Audio)
-     * @param segment - The segment to process
-     * @param priority - The priority of the segment
-     */
-    private buildAudioTranscodeOptions (segment: Segment, priority: number): TaskEither<void> {
-        const argsBuilder: ArgsBuilder = () => {
-            if (this.audioQuality?.value === AudioQualityEnum.ORIGINAL) {
-                return Either.of({
-                    videoFilters: undefined,
-                    inputOptions: [],
-                    outputOptions: [
-                        '-map',
-                        `0:a:${this.streamIndex}`,
-                        '-c:a',
-                        'copy',
-                        '-vn',
-                    ],
-                });
-            }
-
-            return Either.of({
-                videoFilters: undefined,
-                inputOptions: [],
-                outputOptions: [
-                    '-map',
-                    `0:a:${this.streamIndex}`,
-                    '-c:a',
-                    'aac',
-                    '-ac',
-                    '2',
-                    '-b:a',
-                    '128k',
-                    '-vn',
-                ],
-            });
-        };
-
-        return this.buildFFMPEGCommand(segment, argsBuilder, priority);
-    }
-
-    /**
-     * Build the FFMPEG command for video transcoding
-     * @param segment - The segment to process
-     * @param priority - The priority of the segment
-     */
-    private buildVideoTranscodeOptions (segment: Segment, priority: number): TaskEither<void> {
-        const video = this.metadata.videos[this.streamIndex];
-        const videoQuality = this.videoQuality;
-
-        const argsBuilderFactory = (video: VideoInfo, videoQuality: VideoQuality): ArgsBuilder => (segments) => {
-            if (videoQuality.value === VideoQualityEnum.ORIGINAL) {
-                return Either.of({
-                    inputOptions: [],
-                    outputOptions: [
-                        '-map',
-                        `0:v:${this.streamIndex}`,
-                        '-c:v',
-                        'copy',
-                        '-force_key_frames',
-                        segments,
-                        '-strict',
-                        '-2',
-                    ],
-                    videoFilters: undefined,
-                });
-            }
-
-            const detailedQuality = this.buildVideoQuality(videoQuality.value);
-            const codec: CodecType = video.codec.includes('hevc') || video.codec.includes('h265')
-                ? 'h265'
-                : 'h264';
-
-            const options = this.getCachedHardwareOptions(
-                detailedQuality.width,
-                detailedQuality.height,
-                codec,
-            );
-
-            const outputOptions = [
-                '-map',
-                `0:v:${this.streamIndex}`,
-                '-bufsize',
-                `${detailedQuality.maxBitrate * 5}`,
-                '-b:v',
-                `${detailedQuality.averageBitrate}`,
-                '-maxrate',
-                `${detailedQuality.maxBitrate}`,
-                '-forced-idr',
-                '1',
-                ...options.outputOptions,
-                '-force_key_frames',
-                segments,
-                '-strict',
-                '-2',
-            ];
-
-            return Either.of({
-                videoFilters: options.videoFilters,
-                inputOptions: options.inputOptions,
-                outputOptions,
-            });
-        };
-
-        return TaskEither
-            .fromBind({
-                video: TaskEither.fromNullable(video),
-                quality: TaskEither.fromNullable(videoQuality),
-            })
-            .map(({ video, quality }) => argsBuilderFactory(video, quality))
-            .chain((argsBuilder) => this.buildFFMPEGCommand(segment, argsBuilder, priority));
-    }
-
-    /**
-     * Build the segments for this stream
-     */
     private buildSegments (): Map<number, Segment> {
         return this.metadata.keyframes.reduce((segments, startTime, index) => {
             const endTime = index < this.metadata.keyframes.length - 1
@@ -951,574 +704,12 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
             segments.set(index, {
                 index,
-                value: null,
                 start: startTime,
                 duration: endTime - startTime,
             });
 
             return segments;
         }, new Map<number, Segment>());
-    }
-
-    /**
-     * Check the status of the segments
-     */
-    private checkSegmentsStatus (): TaskEither<void> {
-        return TaskEither
-            .of(Array.from(this.segments.values()))
-            .chainItems((segment) => this.checkSegmentFileStatus(segment))
-            .map(() => undefined);
-    }
-
-    /**
-     * Check if the segment file exists
-     * @param segment - The segment to check
-     */
-    private checkSegmentFileStatus (segment: Segment): TaskEither<void> {
-        return this.source.segmentExist(this.type, this.streamIndex, this.quality, segment.index)
-            .filter(
-                (exists) => exists,
-                () => createBadRequestError(`Segment ${segment.index} does not yet exist`),
-            )
-            .map(() => {
-                segment.value = Deferred.create<void>().resolve();
-            });
-    }
-
-    /**
-     * Intelligently filter and prepare segments for processing
-     * Only processes segments that actually need work, respects ongoing jobs
-     * @param initialSegment - The segment to start processing from
-     */
-    private filterAndPrepareSegments (initialSegment: Segment): Segment[] {
-        const allSegments = sortBy(Array.from(this.segments.values()), 'index', 'asc');
-        const startIndex = allSegments.findIndex((s) => s.index === initialSegment.index);
-
-        if (startIndex === -1) {
-            return [];
-        }
-
-        const segmentsToProcess: Segment[] = [];
-        const dynamicBatchSize = this.getDynamicBatchSize();
-        const endIndex = Math.min(startIndex + dynamicBatchSize, allSegments.length);
-
-        for (let i = startIndex; i < endIndex; i++) {
-            const segment = allSegments[i];
-            const state = segment.value?.state();
-
-            if (state === 'pending') {
-                break;
-            }
-
-            if (state === 'fulfilled') {
-                break;
-            }
-
-            if (!segment.value || state === 'rejected') {
-                if (state === 'rejected') {
-                    segment.value!.reset();
-                }
-
-                segment.value = Deferred.create();
-                segmentsToProcess.push(segment);
-            }
-        }
-
-        return segmentsToProcess;
-    }
-
-    /**
-     * Generate FFMPEG transcoding arguments for processing segments
-     */
-    private getTranscodeArgs (builder: ArgsBuilder, segments: Segment[]): Either<FFMPEGOptions> {
-        if (segments.length === 0) {
-            return Either.error(
-                createNotFoundError(
-                    `No segments to process for stream ${this.type} ${this.streamIndex} ${this.quality}`,
-                ),
-            );
-        }
-
-        const startSegment = segments[0];
-        const lastSegment = segments[segments.length - 1];
-
-        let startTime = 0;
-        let startKeyframeIndex = startSegment.index;
-        let keyframeStartTime = 0;
-
-        if (startSegment.index !== 0) {
-            startKeyframeIndex = startSegment.index - 1;
-            const prevSegment = this.segments.get(startKeyframeIndex);
-
-            if (prevSegment) {
-                keyframeStartTime = prevSegment.start;
-
-                if (this.type === StreamType.AUDIO) {
-                    startTime = prevSegment.start;
-                } else if (startSegment.index === this.segments.size - 1) {
-                    startTime = (prevSegment.start + this.metadata.duration) / 2;
-                } else {
-                    startTime = (prevSegment.start + startSegment.start) / 2;
-                }
-            }
-        }
-
-        const nextSegmentIndex = lastSegment.index + 1;
-        const nextSegment = this.segments.get(nextSegmentIndex);
-        const endTime = nextSegment ? nextSegment.start : null;
-
-        let timestamps = segments
-            .filter((segment) => segment.index > startKeyframeIndex)
-            .map((segment) => segment.start);
-
-        if (timestamps.length === 0) {
-            timestamps = [9999999];
-        }
-
-        const segmentTimestamps = timestamps
-            .map((time) => time.toFixed(6))
-            .join(',');
-
-        const relativeTimestamps = timestamps
-            .map((time) => (time - keyframeStartTime).toFixed(6))
-            .join(',');
-
-        const options: FFMPEGOptions = {
-            inputOptions: ['-nostats', '-hide_banner', '-loglevel', 'warning'],
-            outputOptions: [],
-            videoFilters: undefined,
-        };
-
-        if (startTime > 0) {
-            if (this.type === StreamType.VIDEO) {
-                options.inputOptions.push('-noaccurate_seek');
-            }
-
-            options.inputOptions.push('-ss', startTime.toFixed(6));
-        }
-
-        if (endTime !== null) {
-            const adjustedEndTime = endTime + (startTime - keyframeStartTime);
-
-            options.inputOptions.push('-to', adjustedEndTime.toFixed(6));
-        }
-
-        options.inputOptions.push('-fflags', '+genpts');
-
-        return builder(segmentTimestamps)
-            .map((transcodeArgs) => ({
-                inputOptions: [
-                    ...options.inputOptions,
-                    ...transcodeArgs.inputOptions,
-                ],
-                outputOptions: [
-                    ...options.outputOptions,
-                    ...transcodeArgs.outputOptions,
-                    '-start_at_zero',
-                    '-copyts',
-                    '-muxdelay',
-                    '0',
-                    '-f',
-                    'segment',
-                    '-segment_time_delta',
-                    '0.05',
-                    '-segment_format',
-                    'mpegts',
-                    '-segment_times',
-                    relativeTimestamps,
-                    '-segment_list_type',
-                    'flat',
-                    '-segment_list',
-                    'pipe:1',
-                    '-segment_start_number',
-                    startKeyframeIndex.toString(),
-                ],
-                videoFilters: transcodeArgs.videoFilters,
-            }));
-    }
-
-    /**
-     * Build the FFMPEG command for transcoding
-     */
-    private buildFFMPEGCommand (initialSegment: Segment, builder: ArgsBuilder, priority: number): TaskEither<void> {
-        const segmentsToProcess = this.filterAndPrepareSegments(initialSegment);
-
-        if (segmentsToProcess.length === 0) {
-            return TaskEither.fromResult(() => initialSegment.value!.promise());
-        }
-
-        return this.acquireSegmentLock(initialSegment.index)
-            .chain((lock) => {
-                if (!lock && this.lockManager) {
-                    return this.waitForRemoteSegment(initialSegment, {
-                        status: 'processing',
-                        processingNode: 'unknown',
-                        lastUpdated: Date.now(),
-                    });
-                }
-
-                return this.updateDistributedSegmentState(initialSegment.index, {
-                    status: 'processing',
-                    processingNode: this.nodeId,
-                })
-                    .chain(() => this.getTranscodeArgs(builder, segmentsToProcess)
-                        .toTaskEither()
-                        .chain((options) => this.source.getStreamDirectory(this.type, this.streamIndex, this.quality)
-                            .map((outputDir) => ({
-                                options,
-                                outputDir,
-                            })))
-                        .chain(({ options, outputDir }) => this.executeTranscodeCommand(
-                            initialSegment,
-                            segmentsToProcess,
-                            options,
-                            outputDir,
-                            priority,
-                            lock,
-                        )))
-                    .chain(() => TaskEither.fromResult(() => initialSegment.value!.promise()));
-            });
-    }
-
-    /**
-     * Execute the actual Ffmpeg transcoding command
-     */
-    private executeTranscodeCommand (
-        initialSegment: Segment,
-        segments: Segment[],
-        options: FFMPEGOptions,
-        outputDir: string,
-        priority: number,
-        lock: Lock | null,
-    ): TaskEither<void> {
-        return TaskEither.tryCatch(
-            () => this.setupAndRunCommand(initialSegment, segments, options, outputDir, priority, lock),
-            'Failed to execute transcode command',
-        );
-    }
-
-    /**
-     * Setup and run the Ffmpeg command with proper event handling
-     */
-    private setupAndRunCommand (
-        initialSegment: Segment,
-        segments: Segment[],
-        options: FFMPEGOptions,
-        outputDir: string,
-        priority: number,
-        lock: Lock | null,
-    ): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const command = this.createFfmpegCommand(options, outputDir);
-            const job = this.createTranscodeJob(initialSegment, priority, command);
-            const jobRange = this.createJobRange(initialSegment, segments);
-
-            this.setupCommandEventHandlers(command, job, jobRange, segments, lock, resolve, reject);
-
-            this.emit('transcode:queued', job);
-            this.jobRange.push(jobRange);
-            this.metrics.totalJobsStarted++;
-        });
-    }
-
-    /**
-     * Create the Ffmpeg command with options
-     */
-    private createFfmpegCommand (options: FFMPEGOptions, outputDir: string): FfmpegCommand {
-        const { inputOptions, outputOptions, videoFilters } = options;
-
-        const command = ffmpeg(this.source.getFilePath())
-            .inputOptions(inputOptions)
-            .outputOptions(outputOptions)
-            .output(path.join(outputDir, 'segment-%d.ts'));
-
-        if (videoFilters) {
-            command.videoFilters(videoFilters);
-        }
-
-        return command;
-    }
-
-    /**
-     * Create a transcode job
-     */
-    private createTranscodeJob (initialSegment: Segment, priority: number, command: FfmpegCommand): TranscodeJob {
-        return {
-            id: `job-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
-            priority,
-            process: command,
-            createdAt: Date.now(),
-            start: initialSegment.start,
-            status: TranscodeStatus.QUEUED,
-        };
-    }
-
-    /**
-     * Create a job range
-     */
-    private createJobRange (initialSegment: Segment, segments: Segment[]): JobRange {
-        return {
-            start: initialSegment.start,
-            status: JobRangeStatus.PROCESSING,
-            end: segments[segments.length - 1].duration,
-        };
-    }
-
-    /**
-     * Set up comprehensive event handlers for the Ffmpeg command
-     * @param command - The Ffmpeg command
-     * @param job - The transcode job
-     * @param jobRange - The job range
-     * @param segments - The segments being processed
-     * @param lock - The distributed lock (if any)
-     * @param resolve - Resolve function
-     * @param reject - Reject function
-     */
-    private setupCommandEventHandlers (
-        command: FfmpegCommand,
-        job: TranscodeJob,
-        jobRange: JobRange,
-        segments: Segment[],
-        lock: Lock | null,
-        resolve: () => void,
-        reject: (error: Error) => void,
-    ): void {
-        let lastIndex = segments[0].index;
-        const startTime = Date.now();
-
-        const disposeHandler = () => {
-            command.kill('SIGINT');
-            this.off('dispose', disposeHandler);
-            reject(new Error('Stream disposed during transcoding'));
-        };
-
-        command.on('start', () => {
-            job.status = TranscodeStatus.PROCESSING;
-            this.emit('transcode:start', job);
-            this.emitMetrics();
-        });
-
-        command.on('progress', async (progress) => {
-            lastIndex = progress.segment;
-            this.handleSegmentProgress(progress.segment, segments);
-
-            // Extend lock periodically
-            if (lock && await lock.isValid()) {
-                void lock.extend(this.config.segmentTimeout * 2);
-            }
-        });
-
-        command.on('end', () => {
-            const processingTime = Date.now() - startTime;
-
-            this.updateMetricsOnSuccess(segments.length, processingTime);
-
-            job.status = TranscodeStatus.PROCESSED;
-            jobRange.status = JobRangeStatus.PROCESSED;
-
-            // Update distributed state for all processed segments
-            segments.forEach((segment) => {
-                void this.updateDistributedSegmentState(segment.index, {
-                    status: 'completed',
-                    processingNode: this.nodeId,
-                });
-            });
-
-            // Release lock
-            if (lock) {
-                void lock.release();
-            }
-
-            this.emit('transcode:complete', job);
-            this.emitMetrics();
-            this.off('dispose', disposeHandler);
-            resolve();
-        });
-
-        command.on('error', (err: Error) => {
-            this.handleTranscodeError(err, job, jobRange, segments, lastIndex, lock, disposeHandler);
-
-            if (this.shouldRetryWithFallback(err, segments[0].index)) {
-                this.retryWithFallback(segments[0], job, lock, resolve, reject);
-            } else {
-                this.emitMetrics();
-                reject(err);
-            }
-        });
-
-        this.on('dispose', disposeHandler);
-    }
-
-    /**
-     * Handle segment progress updates
-     * @param segmentIndex - The index of the segment
-     * @param segments - The segments being processed
-     */
-    private handleSegmentProgress (segmentIndex: number, segments: Segment[]): void {
-        const segment = this.segments.get(segmentIndex);
-        const nextSegment = this.segments.get(segmentIndex + 1);
-
-        if (nextSegment && nextSegment.value?.state() === 'fulfilled') {
-            // Optionally kill command early for efficiency
-            // command.kill('SIGINT');
-        }
-
-        if (segment) {
-            segment.value = segment.value?.resolve() ?? Deferred.create<void>().resolve();
-            this.metrics.segmentsProcessed++;
-        }
-    }
-
-    /**
-	 * Handle transcoding errors with potential hardware acceleration fallback
-	 * @param err - The error that occurred
-	 * @param job - The job that was processing
-	 * @param jobRange - The job range that was processing
-	 * @param segments - The segments that were being processed
-	 * @param lastIndex - The last index processed
-	 * @param lock - The distributed lock (if any)
-	 * @param disposeHandler - The dispose handler to call
-	 */
-    private handleTranscodeError (
-        err: Error,
-        job: TranscodeJob,
-        jobRange: JobRange,
-        segments: Segment[],
-        lastIndex: number,
-        lock: Lock | null,
-        disposeHandler: () => void,
-    ): void {
-        try {
-            const unprocessedSegments = segments.filter(
-                (segment) => segment.index > lastIndex &&
-					segment.value?.state() === 'pending',
-            );
-
-            let rejectedCount = 0;
-
-            for (const segment of unprocessedSegments) {
-                try {
-                    if (segment.value && segment.value.state() === 'pending') {
-                        segment.value.reject(new Error(err.message));
-                        rejectedCount++;
-
-                        // Update distributed state
-                        void this.updateDistributedSegmentState(segment.index, {
-                            status: 'failed',
-                            processingNode: this.nodeId,
-                        });
-                    }
-                } catch (segmentError) {
-                    console.warn(`Failed to reject segment ${segment.index}:`, segmentError);
-                }
-            }
-
-            this.metrics.segmentsFailed += rejectedCount;
-
-            job.status = TranscodeStatus.ERROR;
-            jobRange.status = JobRangeStatus.ERROR;
-
-            // Release lock on error
-            if (lock) {
-                void lock.release();
-            }
-
-            this.emit('transcode:error', {
-                job,
-                error: err,
-            });
-
-            this.off('dispose', disposeHandler);
-        } catch (handlingError) {
-            console.error('Error in handleTranscodeError:', handlingError);
-            job.status = TranscodeStatus.ERROR;
-            jobRange.status = JobRangeStatus.ERROR;
-
-            if (lock) {
-                void lock.release();
-            }
-        }
-    }
-
-    /**
-	 * Check if we should retry with fallback
-	 * @param err - The error to check
-	 * @param segmentIndex - The index of the segment
-	 */
-    private shouldRetryWithFallback (err: Error, segmentIndex: number): boolean {
-        if (!this.config.enableHardwareAccelFallback ||
-			!this.optimisedAccel ||
-			this.hasFallenBackToSoftware) {
-            return false;
-        }
-
-        if (!this.isHardwareAccelerationError(err)) {
-            return false;
-        }
-
-        const retryCount = this.segmentRetries.get(segmentIndex) || 0;
-
-        return retryCount < this.config.maxRetries;
-    }
-
-    /**
-     * Retry transcoding with software fallback
-     * @param segment - The segment to retry
-     * @param originalJob - The original job
-     * @param lock - The distributed lock (if any)
-     * @param resolve - Resolve function
-     * @param reject - Reject function
-     */
-    private retryWithFallback (
-        segment: Segment,
-        originalJob: TranscodeJob,
-        lock: Lock | null,
-        resolve: () => void,
-        reject: (error: Error) => void,
-    ): void {
-        const previousMethod = this.optimisedAccel?.method || 'unknown';
-
-        this.fallbackToSoftwareEncoding();
-
-        const retryCount = (this.segmentRetries.get(segment.index) || 0) + 1;
-
-        this.segmentRetries.set(segment.index, retryCount);
-
-        // Release lock before retry
-        if (lock) {
-            void lock.release();
-        }
-
-        this.emit('transcode:fallback', {
-            job: originalJob,
-            from: previousMethod,
-            to: 'software',
-        });
-
-        this.emitMetrics();
-
-        const retryAction = this.type === StreamType.AUDIO
-            ? this.buildAudioTranscodeOptions(segment, originalJob.priority)
-            : this.buildVideoTranscodeOptions(segment, originalJob.priority);
-
-        return void retryAction
-            .toResult()
-            .then(resolve)
-            .catch(reject);
-    }
-
-    /**
-	 * Update metrics on successful completion
-	 * @param segmentCount - Number of segments processed
-	 * @param processingTime - Time taken to process segments
-	 */
-    private updateMetricsOnSuccess (segmentCount: number, processingTime: number): void {
-        this.metrics.totalJobsCompleted++;
-
-        const totalJobs = this.metrics.totalJobsCompleted;
-
-        this.metrics.averageProcessingTime =
-			(this.metrics.averageProcessingTime * (totalJobs - 1) + processingTime) / totalJobs;
     }
 
     /**
@@ -1557,48 +748,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
         }
 
         this.timer = setTimeout(() => this.dispose(), this.config.disposeTimeout);
-    }
-
-    /**
-	 * Calculate distance from current encoders to a segment
-	 * @param segmentIndex - The index of the segment
-	 */
-    private getMinEncoderDistance (segmentIndex: number): number {
-        const segment = this.segments.get(segmentIndex);
-
-        if (!segment) {
-            return Infinity;
-        }
-
-        const targetTime = segment.start;
-
-        const distances = this.jobRange
-            .filter((range) => range.status === JobRangeStatus.PROCESSING &&
-				range.start <= targetTime &&
-				targetTime <= range.start + range.end)
-            .map((range) => targetTime - range.start);
-
-        if (distances.length === 0) {
-            return Infinity;
-        }
-
-        return Math.min(...distances);
-    }
-
-    /**
-	 * Check if a segment is already scheduled for processing
-	 * @param segmentIndex - The index of the segment
-	 */
-    private isSegmentScheduled (segmentIndex: number): boolean {
-        const segment = this.segments.get(segmentIndex);
-
-        if (!segment) {
-            return false;
-        }
-
-        return this.jobRange.some((range) => range.status === JobRangeStatus.PROCESSING &&
-			segment.start >= range.start &&
-			segment.start <= (range.start + range.end));
     }
 
     /**
