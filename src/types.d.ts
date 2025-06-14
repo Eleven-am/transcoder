@@ -162,30 +162,6 @@ export interface EventBus {
 	unsubscribeAll(): Promise<void>;
 }
 
-export interface DistributedConfig {
-	stateStore?: StateStore;
-	jobQueue?: JobQueue;
-	lockManager?: LockManager;
-	eventBus?: EventBus;
-}
-
-export interface RedisDistributedBackendOptions {
-	config: {
-		host: string;
-		port: number;
-		password?: string;
-		database?: number;
-	} | {
-		url: string;
-	};
-	options?: {
-		keyPrefix?: string;
-		queueName?: string;
-		lockPrefix?: string;
-		channelPrefix?: string;
-	};
-}
-
 export enum StreamType {
 	VIDEO = 'v',
 	AUDIO = 'a',
@@ -299,7 +275,6 @@ export interface HLSManagerOptions {
 	videoQualities?: VideoQualityEnum[];
 	audioQualities?: AudioQualityEnum[];
 	config?: Partial<StreamConfig>;
-	distributed?: DistributedConfig;
 	inactivityCheckFrequency?: number;
 	unusedStreamDebounceDelay?: number;
 	inactivityThreshold?: number;
@@ -496,8 +471,6 @@ export declare class HLSController {
 	 */
 	createMetadata (filePath: string): Promise<void>;
 }
-
-export declare function createRedisBackend(options: RedisDistributedBackendOptions): DistributedConfig;
 
 export declare class FfmpegCommand {
 	/**
