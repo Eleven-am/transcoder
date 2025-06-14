@@ -4,8 +4,10 @@ import * as os from 'os';
 
 import { TaskEither } from '@eleven-am/fp';
 
+import { DistributedTranscodeJob, SegmentCoordinator, TranscodeJobQueue } from './distributed';
+import ffmpeg from './ffmpeg';
 import { QualityService } from './qualityService';
-import { AudioQualityEnum, StreamType, TranscodeJob, VideoQualityEnum } from './types';
+import { AudioQualityEnum, StreamType, VideoQualityEnum } from './types';
 import { ExtendedEventEmitter } from './utils';
 
 interface ClientState {
@@ -54,6 +56,10 @@ interface ClientTrackerEvents {
 
     // Session events
     'session:updated': ClientInternalState;
+
+    // Job events
+    'job:completed': { jobId: string };
+    'job:failed': { jobId: string, error: string };
 }
 
 enum ClientBehavior {
@@ -63,11 +69,11 @@ enum ClientBehavior {
 }
 
 /**
- * ClientTracker - Monitors client activity and manages resources
+ * ClientTracker - Monitors client activity and manages distributed transcoding
  *
  * This class tracks which clients are using which streams and ensures
  * that unused resources are cleaned up to optimize system resource usage.
- * It also manages transcoding job priorities and execution.
+ * It also manages distributed transcoding job priorities and execution.
  */
 export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
     private readonly clients: Map<string, ClientInfo>;
@@ -86,9 +92,7 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
 
     private readonly pendingUnusedStreams: Map<string, NodeJS.Timeout>;
 
-    private readonly jobQueueItems: TranscodeJob[] = [];
-
-    private readonly activeJobs: Map<string, TranscodeJob>;
+    private readonly activeJobs: Map<string, DistributedTranscodeJob>;
 
     private queueProcessorTimer: NodeJS.Timeout | null = null;
 
@@ -102,8 +106,12 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
 
     private readonly loadCheckThreshold: number = 10;
 
+    private readonly nodeId: string;
+
     constructor (
         private readonly qualityService: QualityService,
+        private readonly segmentCoordinator: SegmentCoordinator,
+        private readonly jobQueue: TranscodeJobQueue,
         private readonly inactivityCheckFrequency: number = 60_000,
         private readonly unusedStreamDebounceDelay: number = 300_000,
         private readonly inactivityThreshold: number = 1_800_000,
@@ -111,6 +119,7 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
     ) {
         super();
 
+        this.nodeId = `node-${process.pid}-${Date.now()}`;
         this.clients = new Map();
         this.states = new Map();
         this.clientSegmentHistory = new Map();
@@ -120,9 +129,16 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         this.streamLastAccess = new Map();
         this.pendingUnusedStreams = new Map();
 
-        this.activeJobs = new Map<string, TranscodeJob>();
+        this.activeJobs = new Map<string, DistributedTranscodeJob>();
 
         this.initialize();
+    }
+
+    /**
+	 * Get the segment coordinator (used by Stream class)
+	 */
+    public getSegmentCoordinator (): SegmentCoordinator {
+        return this.segmentCoordinator;
     }
 
     /**
@@ -144,17 +160,7 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         }
 
         this.pendingUnusedStreams.clear();
-
-        for (const job of this.activeJobs.values()) {
-            try {
-                job.process.kill();
-            } catch (err) {
-                // no-op
-            }
-        }
-
         this.activeJobs.clear();
-        this.jobQueueItems.length = 0;
     }
 
     /**
@@ -266,10 +272,10 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
 
     /**
 	 * Handle a new transcode job from a stream
-	 * @param job The transcode job to queue
+	 * @param job The distributed transcode job to queue
 	 */
-    public handleTranscodeJob (job: TranscodeJob): void {
-        this.enqueueJob(job);
+    public handleTranscodeJob (job: DistributedTranscodeJob): void {
+        void this.enqueueJob(job);
         this.processJobQueue();
     }
 
@@ -281,34 +287,165 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         this.inactivityCheckInterval = setInterval(() => {
             this.checkForIdleStreams();
             this.checkForInactiveClients();
-            this.updateSystemLoad();
-            this.cleanupJobQueue();
+            void this.updateSystemLoad().toResult();
+            this.cleanupActiveJobs();
         }, this.inactivityCheckFrequency);
+
+        // Start job processing loop
+        this.processJobQueue();
     }
 
     /**
-	 * Add a job to the priority queue (highest priority first)
+	 * Update system load and emit events if significant changes
+	 */
+    private updateSystemLoad (): TaskEither<void> {
+        return this.calculateSystemLoad()
+            .map((load) => {
+                const previousLoad = this.lastSystemLoad;
+
+                this.lastSystemLoad = load;
+
+                if (Math.abs(load - previousLoad) >= this.loadCheckThreshold) {
+                    this.emit('system:loadChanged', { load,
+                        previousLoad });
+                }
+
+                if (load >= this.overloadThreshold && previousLoad < this.overloadThreshold) {
+                    this.emit('system:overloaded', {
+                        load,
+                        activeClients: this.clients.size,
+                    });
+                } else if (load < this.overloadThreshold && previousLoad >= this.overloadThreshold) {
+                    this.emit('system:stable', {
+                        load,
+                        activeClients: this.clients.size,
+                    });
+                }
+            });
+    }
+
+    /**
+	 * Add a job to the distributed queue
 	 * @param job The job to enqueue
 	 */
-    private enqueueJob (job: TranscodeJob): void {
-        this.jobQueueItems.push(job);
-        this.jobQueueItems.sort((a, b) => b.priority - a.priority);
+    private async enqueueJob (job: DistributedTranscodeJob): Promise<void> {
+        try {
+            await this.jobQueue.push(job);
+        } catch (error) {
+            console.error('Failed to enqueue job:', error);
+        }
     }
 
     /**
-	 * Remove and return the highest priority job from the queue
-	 * @returns The highest priority job, or undefined if queue is empty
+	 * Process jobs from the distributed queue
 	 */
-    private dequeueJob (): TranscodeJob | undefined {
-        return this.jobQueueItems.shift();
+    private processJobQueue (): void {
+        if (this.queueProcessorTimer !== null) {
+            return;
+        }
+
+        const processNextJob = async () => {
+            try {
+                const load = await this.calculateSystemLoad().toPromise();
+
+                // Check if we can start new jobs
+                if (!this.canStartNewJob(load)) {
+                    return;
+                }
+
+                // Try to get a job from the queue
+                const job = await this.jobQueue.pop(this.nodeId);
+
+                if (job) {
+                    await this.executeJob(job);
+                }
+            } catch (error) {
+                console.error('Error processing job queue:', error);
+            }
+        };
+
+        const scheduleNext = (delay: number = 1000) => {
+            this.queueProcessorTimer = setTimeout(async () => {
+                this.queueProcessorTimer = null;
+                await processNextJob();
+                this.processJobQueue(); // Schedule next iteration
+            }, delay);
+        };
+
+        void processNextJob().then(() => scheduleNext());
     }
 
     /**
-	 * Check if the job queue is empty
-	 * @returns True if the queue is empty
+	 * Execute a distributed transcode job
+	 * @param job The job to execute
 	 */
-    private isJobQueueEmpty (): boolean {
-        return this.jobQueueItems.length === 0;
+    private async executeJob (job: DistributedTranscodeJob): Promise<void> {
+        this.activeJobs.set(job.id, job);
+
+        try {
+            // Create FFmpeg command from job data
+            const command = ffmpeg(job.filePath)
+                .inputOptions(job.inputOptions)
+                .outputOptions(job.outputOptions)
+                .output(job.outputPath);
+
+            if (job.videoFilters) {
+                command.videoFilters(job.videoFilters);
+            }
+
+            // Set up event handlers
+            command.on('start', () => {
+                console.log(`Started job ${job.id} for segment ${job.segmentIndex}`);
+            });
+
+            command.on('progress', async (progress) => {
+                // Update segment coordinator as segments complete
+                const segmentId = `${job.fileId}:${job.streamType}:${job.streamIndex}:${job.quality}:${progress.segment}`;
+
+                try {
+                    await this.segmentCoordinator.markSegmentComplete(segmentId);
+                } catch (error) {
+                    console.warn(`Failed to mark segment complete: ${segmentId}`, error);
+                }
+            });
+
+            command.on('end', async () => {
+                try {
+                    await this.jobQueue.complete(job.id);
+                    this.emit('job:completed', { jobId: job.id });
+                    console.log(`Completed job ${job.id}`);
+                } catch (error) {
+                    console.error(`Failed to mark job complete: ${job.id}`, error);
+                } finally {
+                    this.activeJobs.delete(job.id);
+                }
+            });
+
+            command.on('error', async (error) => {
+                try {
+                    await this.jobQueue.fail(job.id, error.message, true); // Requeue on failure
+                    this.emit('job:failed', { jobId: job.id,
+                        error: error.message });
+                    console.error(`Job ${job.id} failed:`, error.message);
+                } catch (failError) {
+                    console.error(`Failed to mark job failed: ${job.id}`, failError);
+                } finally {
+                    this.activeJobs.delete(job.id);
+                }
+            });
+
+            // Start the job
+            command.run();
+        } catch (error) {
+            console.error(`Failed to execute job ${job.id}:`, error);
+            this.activeJobs.delete(job.id);
+
+            try {
+                await this.jobQueue.fail(job.id, error instanceof Error ? error.message : 'Unknown error');
+            } catch (failError) {
+                console.error(`Failed to mark job failed: ${job.id}`, failError);
+            }
+        }
     }
 
     /**
@@ -347,6 +484,11 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
                         this.streamLastAccess.delete(streamId);
                         this.pendingUnusedStreams.delete(streamId);
                         this.streamClientMap.delete(streamId);
+
+                        // Clean up segment coordinator state for this stream
+                        void this.segmentCoordinator.cleanup(streamId).catch((error) => {
+                            console.warn(`Failed to cleanup segment coordinator for stream ${streamId}:`, error);
+                        });
                     }
                 } catch (err) {
                     this.pendingUnusedStreams.delete(streamId);
@@ -380,7 +522,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         const now = new Date();
 
         this.clientLastAccess.set(clientId, now);
-
         this.streamLastAccess.set(streamId, now);
 
         if (!this.clientStreamMap.has(clientId)) {
@@ -511,81 +652,22 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
     }
 
     /**
-	 * Process the job queue, starting jobs if possible
+	 * Clean up stalled active jobs
 	 */
-    private processJobQueue (): void {
-        if (this.queueProcessorTimer !== null) {
-            return;
-        }
-
-        const manageLoad = (load: number) => {
-            try {
-                while (this.canStartNewJob(load) && !this.isJobQueueEmpty()) {
-                    const job = this.dequeueJob();
-
-                    if (job) {
-                        try {
-                            this.activeJobs.set(job.id, job);
-
-                            job.process.on('end', () => {
-                                this.activeJobs.delete(job.id);
-                            });
-
-                            job.process.on('error', () => {
-                                this.activeJobs.delete(job.id);
-                            });
-
-                            job.process.run();
-                        } catch (err) {
-                            // no-op
-                        }
-                    }
-                }
-
-                if (!this.isJobQueueEmpty()) {
-                    const delay = Math.min(2000, Math.max(200, Math.floor(load * 20)));
-
-                    this.queueProcessorTimer = setTimeout(() => {
-                        this.queueProcessorTimer = null;
-                        this.processJobQueue();
-                    }, delay);
-                } else {
-                    this.queueProcessorTimer = null;
-                }
-            } catch (err) {
-                this.queueProcessorTimer = null;
-
-                if (!this.isJobQueueEmpty()) {
-                    setTimeout(() => this.processJobQueue(), 5000);
-                }
-            }
-        };
-
-        void this.calculateSystemLoad().map(manageLoad)
-            .toResult();
-    }
-
-    /**
-	 * Clean up stalled jobs from the job queue
-	 */
-    private cleanupJobQueue (): void {
+    private cleanupActiveJobs (): void {
         const now = Date.now();
-        const STALLED_JOB_THRESHOLD = 5 * 60 * 1000;
+        const STALLED_JOB_THRESHOLD = 10 * 60 * 1000; // 10 minutes
 
         for (const [jobId, job] of this.activeJobs.entries()) {
             if (job.createdAt && (now - job.createdAt) > STALLED_JOB_THRESHOLD) {
-                try {
-                    job.process.kill();
-                } catch (err) {
-                    // no-op
-                }
-
+                console.warn(`Cleaning up stalled job: ${jobId}`);
                 this.activeJobs.delete(jobId);
-            }
-        }
 
-        if (!this.isJobQueueEmpty() && this.queueProcessorTimer === null) {
-            this.processJobQueue();
+                // Try to mark as failed in queue
+                void this.jobQueue.fail(jobId, 'Job stalled - cleaned up by tracker').catch((error) => {
+                    console.warn(`Failed to mark stalled job as failed: ${jobId}`, error);
+                });
+            }
         }
     }
 
@@ -595,7 +677,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
     private canStartNewJob (load: number): boolean {
         const activeJobsCount = this.activeJobs.size;
         const maxJobs = this.calculateMaxConcurrentJobs(load);
-
 
         return activeJobsCount < maxJobs;
     }
@@ -612,35 +693,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         }
 
         return this.maxConcurrentJobs;
-    }
-
-    /**
-	 * Update system load and emit events if significant changes
-	 */
-    private updateSystemLoad (): TaskEither<void> {
-        return this.calculateSystemLoad()
-            .map((load) => {
-                const previousLoad = this.lastSystemLoad;
-
-                this.lastSystemLoad = load;
-
-                if (Math.abs(load - previousLoad) >= this.loadCheckThreshold) {
-                    this.emit('system:loadChanged', { load,
-                        previousLoad });
-                }
-
-                if (load >= this.overloadThreshold && previousLoad < this.overloadThreshold) {
-                    this.emit('system:overloaded', {
-                        load,
-                        activeClients: this.clients.size,
-                    });
-                } else if (load < this.overloadThreshold && previousLoad >= this.overloadThreshold) {
-                    this.emit('system:stable', {
-                        load,
-                        activeClients: this.clients.size,
-                    });
-                }
-            });
     }
 
     /**
@@ -676,7 +728,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
                 const idleDiff = end.idle - start.idle;
                 const totalDiff = end.total - start.total;
 
-
                 return Math.max(0, Math.min(100, 100 - Math.round(100 * idleDiff / totalDiff)));
             });
 
@@ -691,7 +742,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
             const totalMemory = os.totalmem();
             const freeMemory = os.freemem();
             const usedMemory = totalMemory - freeMemory;
-
 
             return Math.min(100, (usedMemory / totalMemory) * 100);
         };
@@ -823,6 +873,7 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
 		 */
         const getClientLoadAdjustment = (): number => {
             const activeClientCount = this.clients.size;
+
 
             return Math.min(100, activeClientCount * 5);
         };

@@ -1,5 +1,6 @@
 import { ReadStream } from 'fs';
 import { Readable } from 'stream';
+import {SegmentCoordinator, TranscodeJobQueue} from "./distributed";
 
 /**
  * StateStore provides distributed key-value storage for shared state
@@ -279,6 +280,8 @@ export interface HLSManagerOptions {
 	unusedStreamDebounceDelay?: number;
 	inactivityThreshold?: number;
 	maxConcurrentJobs?: number;
+	segmentCoordinator?: SegmentCoordinator;
+	jobQueue?: TranscodeJobQueue;
 }
 
 export interface VideoQuality {

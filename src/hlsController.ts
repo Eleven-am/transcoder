@@ -1,6 +1,7 @@
 import { createBadRequestError, TaskEither } from '@eleven-am/fp';
 
 import { ClientTracker } from './clientTracker';
+import { createLocalBackend } from './distributed';
 import { FileDatabase } from './fileDatabase';
 import { FileStorage } from './fileStorage';
 import { HardwareAccelerationDetector } from './hardwareAccelerationDetector';
@@ -59,7 +60,19 @@ export class HLSController {
 
         this.#qualityService = new QualityService(options.videoQualities, options.audioQualities);
         this.#metadataService = new MetadataService(this.#qualityService, database);
-        this.#clientTracker = new ClientTracker(this.#qualityService);
+
+        // Create distributed backend if not provided
+        const backend = this.#createBackend(options);
+
+        this.#clientTracker = new ClientTracker(
+            this.#qualityService,
+            backend.segmentCoordinator,
+            backend.jobQueue,
+            options.inactivityCheckFrequency,
+            options.unusedStreamDebounceDelay,
+            options.inactivityThreshold,
+            options.maxConcurrentJobs,
+        );
     }
 
     /**
@@ -259,6 +272,42 @@ export class HLSController {
     }
 
     /**
+	 * Dispose of all resources
+	 */
+    async dispose (): Promise<void> {
+        // Dispose all streams
+        const streamDisposePromises = Array.from(this.#streams.values()).map((stream) => stream.dispose());
+
+        await Promise.allSettled(streamDisposePromises);
+
+        // Dispose client tracker
+        this.#clientTracker.dispose();
+
+        this.#streams.clear();
+    }
+
+    /**
+	 * Create backend based on provided options
+	 */
+    #createBackend (options: HLSManagerOptions) {
+        // If both coordinator and queue are provided, use them
+        if (options.segmentCoordinator && options.jobQueue) {
+            return {
+                segmentCoordinator: options.segmentCoordinator,
+                jobQueue: options.jobQueue,
+            };
+        }
+
+        // If only one is provided, throw error for clarity
+        if (options.segmentCoordinator || options.jobQueue) {
+            throw new Error('Both segmentCoordinator and jobQueue must be provided together');
+        }
+
+        // Default to local backend
+        return createLocalBackend();
+    }
+
+    /**
 	 * Set up client tracker event listeners
 	 * @private
 	 */
@@ -324,6 +373,7 @@ export class HLSController {
                 this.#hwDetector,
                 this.#hwConfig,
                 this.streamConfig,
+                this.#clientTracker.getSegmentCoordinator(),
             )
             .ioSync((stream) => this.#hookUpStream(stream))
             .ioSync((stream) => this.#streams.set(stream.getStreamId(), stream));
