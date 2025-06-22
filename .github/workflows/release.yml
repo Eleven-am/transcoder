@@ -68,3 +68,20 @@ jobs:
           **Full Changelog**: https://github.com/${{ github.repository }}/compare/v${{ steps.version_check.outputs.previous_version }}...v${{ steps.version_check.outputs.new_version }}
         draft: false
         prerelease: false
+        
+    - name: Trigger NPM Publish
+      if: steps.version_check.outputs.version_changed == 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          await github.rest.actions.createWorkflowDispatch({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: 'publish.yml',
+            ref: 'main',
+            inputs: {
+              version: 'skip',
+              tag: 'latest'
+            }
+          })

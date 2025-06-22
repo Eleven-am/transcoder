@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to publish (e.g., patch, minor, major, or specific version)'
+        description: 'Version to publish (e.g., patch, minor, major, skip, or specific version)'
         required: true
         default: 'patch'
       tag:
@@ -58,7 +58,7 @@ jobs:
       run: npm run lint
       
     - name: Version bump (manual trigger)
-      if: github.event_name == 'workflow_dispatch'
+      if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != 'skip'
       run: |
         npm version ${{ github.event.inputs.version }} --no-git-tag-version
         VERSION=$(node -p "require('./package.json').version")
