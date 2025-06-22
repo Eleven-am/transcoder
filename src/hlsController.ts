@@ -289,7 +289,7 @@ export class HLSController {
 				};
 
 				return callback(session);
-			} catch (error) {
+			} catch {
 				// no-op
 			}
 		});

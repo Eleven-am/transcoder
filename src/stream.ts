@@ -168,18 +168,19 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	}
 
 	/**
-     * Create a new stream
-     * @param quality - The quality of the stream
-     * @param type - The type of the stream (audio or video)
-     * @param streamIndex - The index of the stream
-     * @param source - The media source
-     * @param maxSegmentBatchSize - The maximum number of segments to process at once
-     * @param qualityService - The quality service
-     * @param metadataService - The metadata service
-     * @param hwDetector - The hardware acceleration detector
-     * @param hwAccel - The hardware acceleration configuration
-     * @param config - The stream configuration
-     */
+	 * Create a new stream
+	 * @param quality - The quality of the stream
+	 * @param type - The type of the stream (audio or video)
+	 * @param streamIndex - The index of the stream
+	 * @param source - The media source
+	 * @param maxSegmentBatchSize - The maximum number of segments to process at once
+	 * @param qualityService - The quality service
+	 * @param metadataService - The metadata service
+	 * @param hwDetector - The hardware acceleration detector
+	 * @param hwAccel - The hardware acceleration configuration
+	 * @param config - The stream configuration
+	 * @param jobProcessor - The job processor
+	 */
 	static create (
 		quality: string,
 		type: StreamType,
@@ -1108,7 +1109,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
      * @param job - The transcode job
      * @param jobRange - The job range
      * @param segments - The segments being processed
-     * @param lock - The distributed lock (if any)
      * @param resolve - Resolve function
      * @param reject - Reject function
      */
@@ -1137,7 +1137,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
 		command.on('progress', async (progress) => {
 			lastIndex = progress.segment;
-			this.handleSegmentProgress(progress.segment, segments);
+			this.handleSegmentProgress(progress.segment);
 		});
 
 		command.on('end', () => {
@@ -1172,9 +1172,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	/**
      * Handle segment progress updates
      * @param segmentIndex - The index of the segment
-     * @param segments - The segments being processed
      */
-	private handleSegmentProgress (segmentIndex: number, segments: Segment[]): void {
+	private handleSegmentProgress (segmentIndex: number): void {
 		const segment = this.segments.get(segmentIndex);
 		const nextSegment = this.segments.get(segmentIndex + 1);
 
@@ -1196,8 +1195,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	 * @param jobRange - The job range that was processing
 	 * @param segments - The segments that were being processed
 	 * @param lastIndex - The last index processed
-	 * @param lock - The distributed lock (if any)
-	 * @param disposeHandler - The dispose handler to call
+	 * @param disposeHandler - The disposed handler to call
 	 */
 	private handleTranscodeError (
 		err: Error,

@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { createClient, RedisClientType } from 'redis';
+import { RedisClientType } from 'redis';
 
 import { SegmentClaim } from './interfaces';
 

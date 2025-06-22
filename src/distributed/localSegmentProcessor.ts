@@ -70,6 +70,19 @@ export class LocalSegmentProcessor implements ISegmentProcessor {
 		}
 	}
 
+	async isHealthy (): Promise<boolean> {
+		// Local processor is always healthy
+		return !this.disposed;
+	}
+
+	getMode (): 'local' | 'distributed' {
+		return 'local';
+	}
+
+	async dispose (): Promise<void> {
+		this.disposed = true;
+	}
+
 	private async runFFmpeg (data: SegmentProcessingData): Promise<void> {
 		const { inputOptions, outputOptions, videoFilters } = data.ffmpegOptions;
 
@@ -112,7 +125,7 @@ export class LocalSegmentProcessor implements ISegmentProcessor {
 				// Attempt to clean up temp file on error
 				try {
 					await fs.promises.unlink(tempPath);
-				} catch (unlinkError) {
+				} catch {
 					// Ignore unlink errors - file may not exist
 				}
 				reject(err);
@@ -130,18 +143,5 @@ export class LocalSegmentProcessor implements ISegmentProcessor {
 		} catch {
 			return false;
 		}
-	}
-
-	async isHealthy (): Promise<boolean> {
-		// Local processor is always healthy
-		return !this.disposed;
-	}
-
-	getMode (): 'local' | 'distributed' {
-		return 'local';
-	}
-
-	async dispose (): Promise<void> {
-		this.disposed = true;
 	}
 }
