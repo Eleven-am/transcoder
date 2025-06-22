@@ -42,6 +42,11 @@ export class RedisSegmentClaimManager {
 	) {
 		// Default to 7 days if not specified
 		this.completedSegmentTTL = completedSegmentTTL || 7 * 24 * 60 * 60 * 1000;
+		
+		// Validate workerId on construction
+		if (!this.isValidWorkerId(workerId)) {
+			throw new Error(`Invalid workerId: ${workerId}. Must be alphanumeric with hyphens/underscores, max 50 chars`);
+		}
 	}
 
 	/**
@@ -60,6 +65,9 @@ export class RedisSegmentClaimManager {
 		const now = Date.now();
 		const expiresAt = now + this.defaultTTL;
 
+		// Validate inputs before storing
+		const validatedOutputPath = this.validateAndSanitizeOutputPath(outputPath);
+		
 		// Try to acquire lock atomically
 		const acquired = await this.redis.set(
 			lockKey,
@@ -67,7 +75,7 @@ export class RedisSegmentClaimManager {
 				workerId: this.workerId,
 				claimedAt: now,
 				expiresAt,
-				outputPath: outputPath || '',
+				outputPath: validatedOutputPath,
 			}),
 			{ NX: true,
 				PX: this.defaultTTL },
@@ -558,4 +566,44 @@ export class RedisSegmentClaimManager {
 			segmentIndex: parseInt(segmentIndex, 10),
 		};
 	}
+
+	// Input validation methods
+	private isValidWorkerId = (workerId: string): boolean => {
+		if (!workerId || typeof workerId !== 'string') {
+			return false;
+		}
+		// Allow alphanumeric, hyphens, underscores, max 50 characters
+		return /^[a-zA-Z0-9_-]{1,50}$/.test(workerId);
+	};
+
+	private validateAndSanitizeOutputPath = (outputPath?: string): string => {
+		if (!outputPath) {
+			return '';
+		}
+		
+		if (typeof outputPath !== 'string') {
+			throw new Error('Output path must be a string');
+		}
+		
+		// Remove any potential injection characters and limit length
+		let sanitized = outputPath
+			.replace(/["'\\]/g, '') // Remove quotes and backslashes
+			.trim()
+			.substring(0, 500); // Limit to 500 characters
+			
+		// Remove control characters using char code filtering
+		sanitized = sanitized
+			.split('')
+			.filter(char => {
+				const code = char.charCodeAt(0);
+				return code >= 32 && code <= 126; // Only printable ASCII
+			})
+			.join('');
+			
+		if (sanitized.length === 0 && outputPath.length > 0) {
+			throw new Error('Output path contains only invalid characters');
+		}
+		
+		return sanitized;
+	};
 }

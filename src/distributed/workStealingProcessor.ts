@@ -44,6 +44,8 @@ export class WorkStealingProcessor extends EventEmitter implements ISegmentProce
 
 	private isDisposed = false;
 
+	private readonly MAX_STEAL_ATTEMPTS = 500;
+
 	private readonly activeStealAttempts = new Set<string>();
 	
 	// Circuit breaker properties
@@ -293,6 +295,10 @@ export class WorkStealingProcessor extends EventEmitter implements ISegmentProce
 
 	// Pure helper functions for segment stealing
 	private markSegmentAsBeingStolen = (segmentKey: string) => {
+		// Implement bounded Set with LRU eviction
+		if (this.activeStealAttempts.size >= this.MAX_STEAL_ATTEMPTS) {
+			this.evictOldestStealAttempt();
+		}
 		this.activeStealAttempts.add(segmentKey);
 	};
 
@@ -370,7 +376,7 @@ export class WorkStealingProcessor extends EventEmitter implements ISegmentProce
 			this.stealCheckTimer = null;
 		}
 
-		this.activeStealAttempts.clear();
+		this.clearAllStealAttempts();
 
 		await this.baseProcessor.dispose();
 	}
@@ -393,4 +399,16 @@ export class WorkStealingProcessor extends EventEmitter implements ISegmentProce
 			checkInterval: this.config.stealCheckInterval,
 		};
 	}
+
+	// Memory management helper methods
+	private evictOldestStealAttempt = (): void => {
+		const firstKey = this.activeStealAttempts.values().next().value;
+		if (firstKey) {
+			this.activeStealAttempts.delete(firstKey);
+		}
+	};
+
+	private clearAllStealAttempts = (): void => {
+		this.activeStealAttempts.clear();
+	};
 }

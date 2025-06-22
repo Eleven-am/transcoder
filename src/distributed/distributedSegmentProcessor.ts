@@ -53,6 +53,8 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 
 	private disposed = false;
 
+	private readonly MAX_ACTIVE_RENEWALS = 1000;
+
 	private activeRenewals = new Map<string, NodeJS.Timeout>();
 
 	constructor (
@@ -139,10 +141,7 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 		this.disposed = true;
 
 		// Clear all renewal timers
-		for (const timer of this.activeRenewals.values()) {
-			clearInterval(timer);
-		}
-		this.activeRenewals.clear();
+		this.clearAllRenewals();
 
 		// Dispose local processor
 		await this.localProcessor.dispose();
@@ -172,14 +171,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 		outputPath?: string,
 	): Promise<boolean> {
 		return this.claimManager.forceClaimSegment(segmentKey, workerId, outputPath);
-	}
-
-	/**
-	 * Get the claim manager instance
-	 * Public method for work stealing processor
-	 */
-	getClaimManager (): RedisSegmentClaimManager {
-		return this.claimManager;
 	}
 
 	// Pure helper functions for segment processing
@@ -248,6 +239,10 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 				}
 			}, this.claimRenewalInterval);
 
+			// Implement LRU eviction if at capacity
+			if (this.activeRenewals.size >= this.MAX_ACTIVE_RENEWALS) {
+				this.evictOldestRenewal();
+			}
 			this.activeRenewals.set(claim.segmentKey, timer);
 			return timer;
 		});
@@ -301,7 +296,7 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 			if (renewalTimer) {
 				clearInterval(renewalTimer);
 				if (claim?.segmentKey) {
-					this.activeRenewals.delete(claim.segmentKey);
+					this.cleanupRenewal(claim.segmentKey);
 				}
 			}
 		};
@@ -542,4 +537,35 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 
 		return false;
 	}
+
+	/**
+	 * Get the claim manager instance
+	 * Public method for work stealing processor
+	 */
+	getClaimManager (): RedisSegmentClaimManager {
+		return this.claimManager;
+	}
+
+	// Memory management helper methods
+	private evictOldestRenewal = (): void => {
+		const firstKey = this.activeRenewals.keys().next().value;
+		if (firstKey) {
+			this.cleanupRenewal(firstKey);
+		}
+	};
+
+	private cleanupRenewal = (segmentKey: string): void => {
+		const timer = this.activeRenewals.get(segmentKey);
+		if (timer) {
+			clearInterval(timer);
+			this.activeRenewals.delete(segmentKey);
+		}
+	};
+
+	private clearAllRenewals = (): void => {
+		for (const timer of this.activeRenewals.values()) {
+			clearInterval(timer);
+		}
+		this.activeRenewals.clear();
+	};
 }
