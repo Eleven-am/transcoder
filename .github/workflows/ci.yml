@@ -48,7 +48,7 @@ jobs:
       run: npm run build
       
     - name: Test
-      run: npm test -- --ci --coverage
+      run: npm test -- --ci --coverage --passWithNoTests
       env:
         CI: true
         

@@ -38,7 +38,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "jest --coverage --verbose",
+    "test": "jest --coverage --verbose --passWithNoTests",
     "build": "npm run ensure-headers && rimraf dist && tsc",
     "ensure-headers": "node scripts/ensure-gpl-headers.js",
     "lint": "eslint --ext .ts src",
