@@ -1,10 +1,27 @@
+/*
+ * @eleven-am/transcoder
+ * Copyright (C) 2025 Roy OSSAI
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 import { spawn } from 'child_process';
 import * as path from 'path';
 
 import { createBadRequestError, TaskEither } from '@eleven-am/fp';
 
 import { DatabaseConnector } from './databaseConnector';
-import { LockManager } from './distributed';
 import { MediaSource } from './mediaSource';
 import { QualityService } from './qualityService';
 import {
@@ -35,7 +52,6 @@ export class MetadataService {
     constructor (
         private readonly qualityService: QualityService,
         private readonly databaseConnector: DatabaseConnector,
-        private readonly lockManager?: LockManager,
     ) {}
 
     /**
@@ -169,33 +185,13 @@ export class MetadataService {
     }
 
     /**
-     * Extract metadata with distributed locking to prevent duplicate extraction
+     * Extract metadata
      * @param fileId Unique identifier for the media file
      * @param source Media source to extract metadata from
      */
     private extractMetadataWithLock (fileId: string, source: MediaSource): TaskEither<MediaMetadata> {
-        if (!this.lockManager) {
-            return this.extractMediaInfo(fileId, source)
-                .fromPromise((metadata) => this.databaseConnector.saveMetadata(fileId, metadata));
-        }
-
-        const lockKey = `metadata:extract:${fileId}`;
-        const lockTTL = 300000;
-
-        return TaskEither
-            .tryCatch(() => this.lockManager!.tryAcquire(lockKey, lockTTL))
-            .matchTask([
-                {
-                    predicate: (lock) => Boolean(lock),
-                    run: (lock) => this.extractMediaInfo(fileId, source)
-                        .fromPromise((metadata) => this.databaseConnector.saveMetadata(fileId, metadata))
-                        .tap(() => lock!.release()),
-                },
-                {
-                    predicate: (lock) => !lock,
-                    run: () => this.waitForMetadata(fileId),
-                },
-            ]);
+        return this.extractMediaInfo(fileId, source)
+            .fromPromise((metadata) => this.databaseConnector.saveMetadata(fileId, metadata));
     }
 
     /**

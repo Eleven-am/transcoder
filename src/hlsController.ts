@@ -1,10 +1,29 @@
+/*
+ * @eleven-am/transcoder
+ * Copyright (C) 2025 Roy OSSAI
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 import { createBadRequestError, TaskEither } from '@eleven-am/fp';
 
 import { ClientTracker } from './clientTracker';
-import { createBackendConfig, EventBus, LockManager, StateStore } from './distributed';
+import { ISegmentProcessor, SegmentProcessorFactory } from './distributed';
 import { FileDatabase } from './fileDatabase';
 import { FileStorage } from './fileStorage';
 import { HardwareAccelerationDetector } from './hardwareAccelerationDetector';
+import { JobProcessor } from './jobProcessor';
 import { MediaSource } from './mediaSource';
 import { MetadataService } from './metadataService';
 import { QualityService } from './qualityService';
@@ -31,6 +50,8 @@ export class HLSController {
 
     #streamMetricsEventHandler: StreamMetricsEventHandler | null = null;
 
+    #segmentProcessor: ISegmentProcessor | null = null;
+
     readonly #hwDetector: HardwareAccelerationDetector;
 
     readonly #metadataService: MetadataService;
@@ -47,30 +68,19 @@ export class HLSController {
 
     readonly #hwAccelEnabled: boolean;
 
-    readonly #stateStore: StateStore;
+    readonly #jobProcessor: JobProcessor;
 
-    readonly #lockManager: LockManager;
+    readonly #distributedConfig: HLSManagerOptions['distributed'];
 
-    readonly #eventBus: EventBus;
-
-    readonly #nodeId: string;
-
-    private distributedSyncInterval: NodeJS.Timeout | null = null;
+    #loadAdjustmentInterval: NodeJS.Timeout | null = null;
 
     constructor (options: HLSManagerOptions) {
-        this.#nodeId = `controller-${process.pid}-${Date.now()}`;
         this.#streams = new Map<string, Stream>();
 
         this.#hwAccelEnabled = options.hwAccel || false;
         this.#maxSegmentBatchSize = options.maxSegmentBatchSize || 100;
         this.streamConfig = options.config || {};
-
-        // Create distributed backend (falls back to in-memory if not provided)
-        const backend = createBackendConfig(options.distributed);
-
-        this.#stateStore = backend.stateStore;
-        this.#lockManager = backend.lockManager;
-        this.#eventBus = backend.eventBus;
+        this.#distributedConfig = options.distributed;
 
         this.#hwDetector = new HardwareAccelerationDetector();
         this.#fileStorage = new FileStorage(options.cacheDirectory);
@@ -80,7 +90,6 @@ export class HLSController {
         this.#metadataService = new MetadataService(
             this.#qualityService,
             database,
-            options.distributed?.lockManager,
         );
 
         this.#clientTracker = new ClientTracker(
@@ -88,20 +97,32 @@ export class HLSController {
             undefined, // inactivityCheckFrequency
             undefined, // unusedStreamDebounceDelay
             undefined, // inactivityThreshold
-            undefined, // maxConcurrentJobs
-            options.distributed?.stateStore,
-            options.distributed?.jobQueue,
-            options.distributed?.eventBus,
         );
+
+        this.#jobProcessor = new JobProcessor();
     }
 
     /**
      * Initialize the HLS manager
      * This will initialize the transcodeService and detect hardware acceleration
      */
-    initialize (): Promise<void> {
+    async initialize (): Promise<void> {
         this.#hookUpClientTracker();
-        this.#initializeDistributedSync();
+        this.#hookUpJobProcessor();
+
+        // Initialize segment processor
+        if (this.#distributedConfig?.enabled !== false) {
+            this.#segmentProcessor = await SegmentProcessorFactory.create({
+                redisUrl: this.#distributedConfig?.redisUrl,
+                workerId: this.#distributedConfig?.workerId,
+                claimTTL: this.#distributedConfig?.claimTTL,
+                fallbackToLocal: this.#distributedConfig?.fallbackToLocal,
+            });
+
+            const mode = this.#segmentProcessor.getMode();
+
+            console.log(`HLSController initialized with ${mode} segment processing`);
+        }
 
         return this.#hwDetector.detectHardwareAcceleration()
             .filter(
@@ -283,6 +304,27 @@ export class HLSController {
     }
 
     /**
+     * Get the current job processor status
+     * @returns The current status of the job processor
+     */
+    getJobProcessorStatus (): {
+        queueLength: number;
+        activeJobs: number;
+        maxConcurrentJobs: number;
+        isProcessing: boolean;
+    } {
+        return this.#jobProcessor.getStatus();
+    }
+
+    /**
+     * Get the segment processor
+     * @returns The segment processor instance or null
+     */
+    getSegmentProcessor (): ISegmentProcessor | null {
+        return this.#segmentProcessor;
+    }
+
+    /**
      * Create metadata for a media source
      * @param filePath The file path of the media source
      */
@@ -295,10 +337,11 @@ export class HLSController {
     /**
      * Dispose of the controller and clean up resources
      */
-    dispose (): void {
-        if (this.distributedSyncInterval) {
-            clearInterval(this.distributedSyncInterval);
-            this.distributedSyncInterval = null;
+    async dispose (): Promise<void> {
+        // Clear load adjustment interval
+        if (this.#loadAdjustmentInterval) {
+            clearInterval(this.#loadAdjustmentInterval);
+            this.#loadAdjustmentInterval = null;
         }
 
         // Dispose all streams
@@ -307,122 +350,41 @@ export class HLSController {
         }
         this.#streams.clear();
 
+        // Dispose segment processor
+        if (this.#segmentProcessor) {
+            await this.#segmentProcessor.dispose();
+            this.#segmentProcessor = null;
+        }
+
         // Dispose client tracker
         this.#clientTracker.dispose();
 
-        // Clean up distributed state
-        void this.#cleanupDistributedState();
+        // Dispose job processor
+        this.#jobProcessor.dispose();
     }
 
-    /**
-     * Initialize distributed synchronization
-     * @private
-     */
-    #initializeDistributedSync (): void {
-        // Subscribe to distributed events
-        void this.#subscribeToDistributedEvents();
-
-        // Sync with distributed state periodically
-        this.distributedSyncInterval = setInterval(() => {
-            void this.#syncWithDistributedStreams();
-        }, 30_000); // Every 30 seconds
-
-        // Initial sync
-        void this.#syncWithDistributedStreams();
-    }
 
     /**
-     * Subscribe to distributed events
+     * Set up job processor event listeners
      * @private
      */
-    async #subscribeToDistributedEvents (): Promise<void> {
-        // Subscribe to stream lifecycle events
-        await this.#eventBus.subscribe('stream:created', (event) => {
-            if (event.nodeId !== this.#nodeId) {
-                // Update local cache with remote stream info
-                void this.#cacheRemoteStreamInfo(event);
-            }
+    #hookUpJobProcessor (): void {
+        this.#jobProcessor.on('job:failed', ({ job, error }) => {
+            console.error(`Transcode job failed: ${job.id}`, error);
         });
 
-        await this.#eventBus.subscribe('stream:disposed', (event) => {
-            if (event.nodeId !== this.#nodeId) {
-                // Remove stream from local cache
-                this.#streams.delete(event.streamId);
-            }
+        this.#jobProcessor.on('queue:full', ({ size, maxSize }) => {
+            console.warn(`Job queue is full: ${size}/${maxSize}`);
         });
 
-        // Subscribe to metrics events if handler is set
-        await this.#eventBus.subscribe('stream:metrics', (event) => {
-            if (this.#streamMetricsEventHandler) {
-                this.#streamMetricsEventHandler(event);
-            }
+        this.#jobProcessor.on('concurrency:changed', ({ current, max }) => {
+            console.info(`Concurrency changed: ${current}/${max}`);
         });
-    }
 
-    /**
-     * Cache information about remote streams
-     * @private
-     */
-    #cacheRemoteStreamInfo (event: any): TaskEither<void> {
-        const streamKey = `stream:info:${event.streamId}`;
-
-        return TaskEither
-            .tryCatch(
-                () => this.#stateStore.set(streamKey, {
-                    streamId: event.streamId,
-                    nodeId: event.nodeId,
-                    type: event.type,
-                    quality: event.quality,
-                    streamIndex: event.streamIndex,
-                    fileId: event.fileId,
-                    createdAt: event.createdAt,
-                }, 300_000),
-                'Failed to cache stream info',
-            )
-            .map(() => undefined);
-    }
-
-    /**
-     * Sync with distributed stream information
-     * @private
-     */
-    #syncWithDistributedStreams (): TaskEither<void> {
-        return TaskEither
-            .tryCatch(
-                () => this.#stateStore.keys('stream:info:*'),
-                'Failed to get stream keys',
-            )
-            .fromPromise((keys) => this.#stateStore.getMany<any>(keys))
-            .map((streamsMap) => {
-                // Update local knowledge of distributed streams
-                for (const [key, streamInfo] of streamsMap.entries()) {
-                    if (streamInfo && streamInfo.nodeId !== this.#nodeId) {
-                        // Track that this stream exists on another node
-                        // This helps with load balancing decisions
-                    }
-                }
-            });
-    }
-
-    /**
-     * Cleanup distributed state on disposal
-     * @private
-     */
-    async #cleanupDistributedState (): Promise<void> {
-        try {
-            // Clean up any stream info created by this node
-            const streamKeys = await this.#stateStore.keys('stream:info:*');
-
-            for (const key of streamKeys) {
-                const streamInfo = await this.#stateStore.get<any>(key);
-
-                if (streamInfo && streamInfo.nodeId === this.#nodeId) {
-                    await this.#stateStore.delete(key);
-                }
-            }
-        } catch (error) {
-            console.error('Failed to cleanup distributed state:', error);
-        }
+        // Optional: Periodically adjust concurrency based on system load
+        this.#loadAdjustmentInterval = setInterval(() => {
+            this.#jobProcessor.adjustConcurrencyBasedOnLoad();
+        }, 30000); // Every 30 seconds
     }
 
     /**
@@ -430,14 +392,6 @@ export class HLSController {
      * @private
      */
     #hookUpClientTracker (): void {
-        this.#clientTracker.on('system:overloaded', ({ load }) => {
-            console.warn(`System overloaded (${load}%). Throttling transcoding operations.`);
-        });
-
-        this.#clientTracker.on('system:stable', ({ load }) => {
-            console.info(`System load stabilized (${load}%).`);
-        });
-
         this.#clientTracker.on('stream:abandoned', async ({ streamId }) => {
             const stream = this.#streams.get(streamId);
 
@@ -453,19 +407,8 @@ export class HLSController {
      * @private
      */
     #hookUpStream (stream: Stream): void {
-        stream.on('transcode:queued', (job) => {
-            this.#clientTracker.handleTranscodeJob(job);
-        });
-
         stream.on('dispose', ({ id }) => {
             this.#streams.delete(id);
-
-            // Publish stream disposal to distributed system
-            void this.#eventBus.publish('stream:disposed', {
-                nodeId: this.#nodeId,
-                streamId: id,
-                timestamp: Date.now(),
-            });
         });
 
         stream.on('stream:metrics', (event) => {
@@ -498,24 +441,11 @@ export class HLSController {
                 this.#hwDetector,
                 this.#hwConfig,
                 this.streamConfig,
-                this.#stateStore,
-                this.#lockManager,
-                this.#eventBus,
+                this.#jobProcessor,
             )
             .ioSync((stream) => this.#hookUpStream(stream))
             .ioSync((stream) => {
                 this.#streams.set(stream.getStreamId(), stream);
-
-                // Publish stream creation to distributed system
-                void this.#eventBus.publish('stream:created', {
-                    nodeId: this.#nodeId,
-                    streamId: stream.getStreamId(),
-                    type,
-                    quality,
-                    streamIndex,
-                    fileId: stream.getFileId(),
-                    createdAt: Date.now(),
-                });
             });
 
         return source.getFileId()
@@ -527,35 +457,10 @@ export class HLSController {
                     return TaskEither.of(localStream);
                 }
 
-                // Check if stream exists on another node
-                return this.#checkDistributedStreamExists(streamId)
-                    .matchTask([
-                        {
-                            predicate: (exists) => exists,
-                            run: () => createStream(),
-                        },
-                        {
-                            predicate: () => true,
-                            run: () => createStream(),
-                        },
-                    ]);
+                return createStream();
             });
     }
 
-    /**
-     * Check if a stream exists on another node
-     * @private
-     */
-    #checkDistributedStreamExists (streamId: string): TaskEither<boolean> {
-        const streamKey = `stream:info:${streamId}`;
-
-        return TaskEither
-            .tryCatch(
-                () => this.#stateStore.get<any>(streamKey),
-                'Failed to check distributed stream',
-            )
-            .map((streamInfo) => streamInfo !== null);
-    }
 
     /**
      * Get the stream and priority for a media source

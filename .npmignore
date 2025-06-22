@@ -1,0 +1,54 @@
+# Source files
+src/
+*.ts
+!*.d.ts
+
+# Config files
+tsconfig.json
+eslint.config.mjs
+jest.config.js
+.prettierrc
+.prettierignore
+
+# Test files
+**/*.test.ts
+**/*.spec.ts
+coverage/
+__tests__/
+
+# Development files
+.github/
+.vscode/
+.idea/
+*.log
+*.tgz
+
+# Documentation source
+docs/
+
+# Git files
+.git/
+.gitignore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts that shouldn't be published
+*.map
+*.tsbuildinfo
+
+# Example/demo files
+examples/
+demo/
+
+# CI/CD
+.travis.yml
+.circleci/
+.gitlab-ci.yml
+
+# Misc
+.env
+.env.*
+TODO.md
+CONTRIBUTING.md

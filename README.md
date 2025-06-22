@@ -14,6 +14,10 @@ The system automatically detects and configures hardware acceleration (NVIDIA CU
 
 Advanced resource management monitors CPU, memory, and disk I/O to dynamically adjust concurrent transcoding jobs. This prevents system overload while maximizing throughput, making it production-ready for serving multiple concurrent streams.
 
+### Enterprise-Grade Distributed Transcoding
+
+For high-scale deployments, the library supports distributed transcoding across multiple nodes sharing the same storage (e.g., Kubernetes pods with CSI volumes). This allows horizontal scaling of transcoding workloads with automatic coordination through Redis, enabling multiple servers to collaborate on transcoding the same video without duplicating work.
+
 ## Installation
 
 ```bash
@@ -94,6 +98,7 @@ new HLSController(options: HLSManagerOptions)
 - `videoQualities?` (VideoQualityEnum[]): Available video quality levels
 - `audioQualities?` (AudioQualityEnum[]): Available audio quality levels
 - `config?` (Partial<StreamConfig>): Advanced stream configuration options
+- `distributed?` (DistributedConfig): Configuration for distributed transcoding
 
 #### Stream Configuration
 
@@ -284,6 +289,70 @@ const hlsController = new HLSController({
     maxEncoderDistance: 30                // Optimize for closer segments
   }
 });
+```
+
+### Distributed Transcoding Configuration
+
+Enable distributed transcoding across multiple servers:
+
+```typescript
+const hlsController = new HLSController({
+  cacheDirectory: './cache',
+  hwAccel: true,
+  distributed: {
+    enabled: true,                        // Enable distributed mode
+    redisUrl: 'redis://localhost:6379',   // Redis connection URL
+    workerId: process.env.POD_NAME,       // Unique worker identifier
+    claimTTL: 60000,                      // Segment claim TTL (60 seconds)
+    claimRenewalInterval: 20000,          // Renew claims every 20 seconds
+    segmentTimeout: 30000,                // Timeout for segment completion
+    fallbackToLocal: true,                // Fall back to local if Redis unavailable
+    completedSegmentTTL: 7 * 24 * 60 * 60 * 1000,  // 7 days
+    fileWaitTimeout: 10000                // Wait up to 10s for files on shared storage
+  }
+});
+```
+
+#### Distributed Configuration Options
+
+- `enabled?` (boolean): Enable distributed processing mode
+- `redisUrl?` (string): Redis connection URL (can also use REDIS_URL env var)
+- `workerId?` (string): Unique identifier for this worker (defaults to hostname)
+- `claimTTL?` (number): How long to hold a segment claim in milliseconds (default: 60000)
+- `claimRenewalInterval?` (number): How often to renew active claims (default: 20000)
+- `segmentTimeout?` (number): Maximum time to wait for segment completion (default: 30000)
+- `fallbackToLocal?` (boolean): Fall back to local processing if Redis fails (default: true)
+- `completedSegmentTTL?` (number): How long to keep completed segment records (default: 7 days)
+- `fileWaitTimeout?` (number): How long to wait for files on shared storage (default: 10000)
+
+#### Kubernetes Deployment Example
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transcoder
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: transcoder
+        image: your-app:latest
+        env:
+        - name: REDIS_URL
+          value: "redis://redis-service:6379"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: shared-storage
+          mountPath: /cache
+      volumes:
+      - name: shared-storage
+        persistentVolumeClaim:
+          claimName: transcoder-shared-pvc
 ```
 
 ### Preprocessing Media Files
@@ -574,13 +643,20 @@ interface SegmentStream {
 
 ## License
 
-GPL-3.0
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
 
 Copyright (C) 2025 Roy OSSAI
 
 ## Contributing
 
 Contributions are welcome! Please read our contributing guidelines before submitting pull requests.
+
+### Development Scripts
+
+- `npm run ensure-headers` - Automatically adds GPL-3.0 headers to source files
+- `npm run build` - Builds the project (automatically ensures GPL headers)
+- `npm run lint` - Runs ESLint on the codebase
+- `npm test` - Runs the test suite
 
 ## Support
 

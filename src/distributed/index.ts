@@ -1,61 +1,23 @@
-/**
- * Main entry point for distributed functionality.
- * Exports interfaces and implementations for distributed operation.
+/*
+ * @eleven-am/transcoder
+ * Copyright (C) 2025 Roy OSSAI
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { createInMemoryBackend } from './inMemory';
-import { DistributedConfig, EventBus, JobQueue, StateStore } from './interfaces';
-
-// Export all interfaces
-export {
-    StateStore,
-    JobQueue,
-    Lock,
-    LockManager,
-    EventBus,
-    DistributedConfig,
-} from './interfaces';
-
-// Export in-memory implementations
-export {
-    InMemoryStateStore,
-    InMemoryJobQueue,
-    InMemoryLockManager,
-    InMemoryEventBus,
-    createInMemoryBackend,
-} from './inMemory';
-
-// Type guards to check if distributed components are provided
-export function hasDistributedConfig (config: any): config is { distributed: DistributedConfig } {
-    return config && typeof config.distributed === 'object';
-}
-
-export function hasStateStore (config: DistributedConfig): config is DistributedConfig & { stateStore: StateStore } {
-    return config.stateStore !== undefined;
-}
-
-export function hasJobQueue (config: DistributedConfig): config is DistributedConfig & { jobQueue: JobQueue } {
-    return config.jobQueue !== undefined;
-}
-
-export function hasLockManager (config: DistributedConfig): config is DistributedConfig & { lockManager: LockManager } {
-    return config.lockManager !== undefined;
-}
-
-export function hasEventBus (config: DistributedConfig): config is DistributedConfig & { eventBus: EventBus } {
-    return config.eventBus !== undefined;
-}
-
-/**
- * Create a backend configuration with defaults for any missing components
- */
-export function createBackendConfig (distributed?: DistributedConfig): Required<DistributedConfig> {
-    const inMemory = createInMemoryBackend();
-
-    return {
-        stateStore: distributed?.stateStore || inMemory.stateStore,
-        jobQueue: distributed?.jobQueue || inMemory.jobQueue,
-        lockManager: distributed?.lockManager || inMemory.lockManager,
-        eventBus: distributed?.eventBus || inMemory.eventBus,
-    };
-}
+export * from './interfaces';
+export * from './localSegmentProcessor';
+export * from './distributedSegmentProcessor';
+export * from './redisSegmentClaimManager';
+export * from './segmentProcessorFactory';

@@ -1,12 +1,25 @@
-import { exec, execSync } from 'child_process';
-import * as fs from 'fs';
-import * as os from 'os';
+/*
+ * @eleven-am/transcoder
+ * Copyright (C) 2025 Roy OSSAI
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
 
 import { TaskEither } from '@eleven-am/fp';
 
-import { EventBus, JobQueue, StateStore } from './distributed';
 import { QualityService } from './qualityService';
-import { AudioQualityEnum, StreamType, TranscodeJob, VideoQualityEnum } from './types';
+import { AudioQualityEnum, StreamType, VideoQualityEnum } from './types';
 import { ExtendedEventEmitter } from './utils';
 
 interface ClientState {
@@ -48,11 +61,6 @@ interface ClientTrackerEvents {
     'stream:idle': { streamId: string, idleTime: number };
     'stream:abandoned': { streamId: string };
 
-    // System events
-    'system:loadChanged': { load: number, previousLoad: number };
-    'system:overloaded': { load: number, activeClients: number };
-    'system:stable': { load: number, activeClients: number };
-
     // Session events
     'session:updated': ClientInternalState;
 }
@@ -68,11 +76,8 @@ enum ClientBehavior {
  *
  * This class tracks which clients are using which streams and ensures
  * that unused resources are cleaned up to optimize system resource usage.
- * It also manages transcoding job priorities and execution.
  */
 export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
-    private readonly nodeId: string;
-
     private readonly clients: Map<string, ClientInfo>;
 
     private readonly states: Map<string, ClientInternalState>;
@@ -87,15 +92,7 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
 
     private readonly maxSegmentHistorySize: number = 10;
 
-    private lastSystemLoad: number = 0;
-
     private inactivityCheckInterval: NodeJS.Timeout | null = null;
-
-    private readonly overloadThreshold: number = 80;
-
-    private readonly loadCheckThreshold: number = 10;
-
-    private distributedSyncInterval: NodeJS.Timeout | null = null;
 
     private readonly clientLastAccess: Map<string, Date> = new Map();
 
@@ -106,14 +103,9 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         private readonly inactivityCheckFrequency: number = 60_000,
         private readonly unusedStreamDebounceDelay: number = 300_000,
         private readonly inactivityThreshold: number = 1_800_000,
-        private readonly maxConcurrentJobs: number = Math.max(1, os.cpus().length - 1),
-        private readonly stateStore?: StateStore,
-        private readonly jobQueue?: JobQueue,
-        private readonly eventBus?: EventBus,
     ) {
         super();
 
-        this.nodeId = `node-${process.pid}-${Date.now()}`;
         this.clients = new Map();
         this.states = new Map();
         this.clientSegmentHistory = new Map();
@@ -133,21 +125,11 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
             this.inactivityCheckInterval = null;
         }
 
-        if (this.distributedSyncInterval) {
-            clearInterval(this.distributedSyncInterval);
-            this.distributedSyncInterval = null;
-        }
-
         for (const timer of this.pendingUnusedStreams.values()) {
             clearTimeout(timer);
         }
 
         this.pendingUnusedStreams.clear();
-
-        // Unsubscribe from distributed events
-        if (this.eventBus) {
-            void this.eventBus.unsubscribeAll();
-        }
     }
 
     /**
@@ -157,7 +139,7 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
     public registerClientActivity (clientInfo: ClientState): void {
         const now = new Date();
 
-        // Update local state first
+        // Update local state
         const existingClient = this.clients.get(clientInfo.clientId);
 
         const fullClientInfo = {
@@ -189,9 +171,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
                 fileId: clientInfo.fileId,
             });
         }
-
-        // Update distributed state
-        void this.updateDistributedClientState(fullClientInfo);
 
         this.updateClientSession(clientInfo.clientId);
     }
@@ -234,244 +213,33 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
                 break;
         }
 
-        return this.calculateSystemLoad()
-            .map((load) => {
-                if (type === StreamType.VIDEO) {
-                    const qualityInfo = this.qualityService.parseVideoQuality(quality);
+        // Adjust priority based on quality
+        if (type === StreamType.VIDEO) {
+            const qualityInfo = this.qualityService.parseVideoQuality(quality);
 
-                    if (qualityInfo.value === 'original') {
-                        priority -= Math.floor(load / 5);
-                    } else {
-                        const heightFactor = qualityInfo.height <= 480
-                            ? 10 :
-                            qualityInfo.height <= 720 ? 5 : 0;
+            if (qualityInfo.value === 'original') {
+                priority -= 10;
+            } else {
+                // Prioritize lower qualities slightly for better user experience
+                const heightFactor = qualityInfo.height <= 480
+                    ? 10 :
+                    qualityInfo.height <= 720 ? 5 : 0;
 
-                        priority += Math.floor((load / 100) * heightFactor);
-                    }
-                }
-
-                if (load > this.overloadThreshold) {
-                    priority = Math.max(10, priority - 15);
-                } else if (load < 30) {
-                    priority += 10;
-                }
-
-                return Math.max(1, Math.min(100, priority));
-            });
-    }
-
-    /**
-     * Handle a new transcode job from a stream
-     * @param job The transcode job to queue
-     */
-    public handleTranscodeJob (job: TranscodeJob): void {
-        if (this.jobQueue) {
-            // Use distributed job queue
-            void this.jobQueue.push(job);
-        } else {
-            // Local processing
-            void this.processLocalJob(job);
+                priority += heightFactor;
+            }
         }
+
+        return TaskEither.of(Math.max(1, Math.min(100, priority)));
     }
 
     /**
      * Initialize the tracker
      */
     private initialize (): void {
-        void this.updateSystemLoad().toResult();
-
         this.inactivityCheckInterval = setInterval(() => {
             this.checkForIdleStreams();
             this.checkForInactiveClients();
-            this.updateSystemLoad();
         }, this.inactivityCheckFrequency);
-
-        // Set up distributed event subscriptions if available
-        if (this.eventBus) {
-            void this.subscribeToDistributedEvents();
-        }
-
-        // Sync with distributed state periodically
-        if (this.stateStore) {
-            this.distributedSyncInterval = setInterval(() => {
-                void this.syncWithDistributedState();
-            }, 30_000);
-        }
-
-        // Start job processor if we have a distributed queue
-        if (this.jobQueue) {
-            void this.startDistributedJobProcessor();
-        }
-    }
-
-    /**
-     * Subscribe to distributed events
-     */
-    private async subscribeToDistributedEvents (): Promise<void> {
-        if (!this.eventBus) {
-            return;
-        }
-
-        await this.eventBus.subscribe('client:activity', (event) => {
-            if (event.nodeId !== this.nodeId) {
-                // Update local cache with remote client activity
-                this.clients.set(event.clientId, event.clientInfo);
-            }
-        });
-
-        await this.eventBus.subscribe('client:departed', (event) => {
-            if (event.nodeId !== this.nodeId) {
-                // Remove client from local cache
-                this.removeClientLocally(event.clientId);
-            }
-        });
-
-        await this.eventBus.subscribe('stream:idle', (event) => {
-            this.emit('stream:idle', { streamId: event.streamId,
-                idleTime: event.idleTime });
-        });
-
-        await this.eventBus.subscribe('stream:abandoned', (event) => {
-            this.emit('stream:abandoned', { streamId: event.streamId });
-        });
-    }
-
-    /**
-     * Update client state in distributed store
-     */
-    private updateDistributedClientState (clientInfo: ClientInfo): TaskEither<void> {
-        if (!this.stateStore) {
-            return TaskEither.of(undefined);
-        }
-
-        const clientKey = `client:${clientInfo.clientId}`;
-        const streamKey = `client:${clientInfo.clientId}:streams`;
-
-        return TaskEither.fromBind({
-            saveClient: TaskEither.tryCatch(
-                () => this.stateStore!.set(clientKey, clientInfo, this.inactivityThreshold),
-                'Failed to save client state',
-            ),
-            publishEvent: this.eventBus
-                ? TaskEither.tryCatch(
-                    () => this.eventBus!.publish('client:activity', {
-                        nodeId: this.nodeId,
-                        clientId: clientInfo.clientId,
-                        clientInfo,
-                    }),
-                    'Failed to publish client activity',
-                )
-                : TaskEither.of(undefined),
-        }).map(() => undefined);
-    }
-
-    /**
-     * Sync with distributed state periodically
-     */
-    private syncWithDistributedState (): TaskEither<void> {
-        if (!this.stateStore) {
-            return TaskEither.of(undefined);
-        }
-
-        return TaskEither
-            .tryCatch(
-                () => this.stateStore!.keys('client:*'),
-                'Failed to get client keys',
-            )
-            .chain((keys) => {
-                const clientKeys = keys.filter((k) => !k.includes(':streams'));
-
-
-                return TaskEither.tryCatch(
-                    () => this.stateStore!.getMany<ClientInfo>(clientKeys),
-                    'Failed to get clients from store',
-                );
-            })
-            .map((clientsMap) => {
-                // Update local cache with distributed state
-                for (const [key, client] of clientsMap.entries()) {
-                    if (client && !this.clients.has(client.clientId)) {
-                        this.clients.set(client.clientId, client);
-                    }
-                }
-            });
-    }
-
-    /**
-     * Start distributed job processor
-     */
-    private async startDistributedJobProcessor (): Promise<void> {
-        if (!this.jobQueue) {
-            return;
-        }
-
-        while (true) {
-            try {
-                // Block waiting for next job (with timeout)
-                const job = await this.jobQueue.pop(5000);
-
-                if (job) {
-                    await this.processLocalJob(job);
-                }
-            } catch (error) {
-                console.error('Error processing distributed job:', error);
-                // Wait before retrying
-                await new Promise((resolve) => setTimeout(resolve, 1000));
-            }
-        }
-    }
-
-    /**
-     * Process a job locally
-     */
-    private async processLocalJob (job: TranscodeJob): Promise<void> {
-        const systemLoad = await this.calculateSystemLoad().toPromise();
-
-        if (this.canStartNewJob(systemLoad)) {
-            try {
-                job.process.on('end', () => {
-                    void this.updateDistributedMetrics('completed');
-                });
-
-                job.process.on('error', () => {
-                    void this.updateDistributedMetrics('failed');
-
-                    // Requeue job if using distributed queue
-                    if (this.jobQueue) {
-                        void this.jobQueue.requeue(job);
-                    }
-                });
-
-                job.process.run();
-                void this.updateDistributedMetrics('started');
-            } catch (err) {
-                console.error('Failed to start job:', err);
-
-                if (this.jobQueue) {
-                    void this.jobQueue.requeue(job);
-                }
-            }
-        } else if (this.jobQueue) {
-            void this.jobQueue.requeue(job);
-        }
-    }
-
-    /**
-     * Update distributed metrics
-     */
-    private updateDistributedMetrics (type: 'started' | 'completed' | 'failed'): TaskEither<void> {
-        if (!this.stateStore) {
-            return TaskEither.of(undefined);
-        }
-
-        const metricsKey = `metrics:${this.nodeId}:${type}`;
-
-        return TaskEither
-            .tryCatch(
-                () => this.stateStore!.increment(metricsKey),
-                'Failed to update metrics',
-            )
-            .map(() => undefined);
     }
 
     /**
@@ -486,15 +254,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
             if (!this.streamClientMap.has(streamId) || this.streamClientMap.get(streamId)!.size === 0) {
                 if (this.pendingUnusedStreams.has(streamId)) {
                     continue;
-                }
-
-                // Publish to distributed event bus if available
-                if (this.eventBus) {
-                    void this.eventBus.publish('stream:idle', {
-                        nodeId: this.nodeId,
-                        streamId,
-                        idleTime,
-                    });
                 }
 
                 this.emit('stream:idle', { streamId,
@@ -514,27 +273,19 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
             const timer = setTimeout(() => {
                 try {
                     if (!this.streamClientMap.has(streamId) || this.streamClientMap.get(streamId)!.size === 0) {
-                        // Publish to distributed event bus if available
-                        if (this.eventBus) {
-                            void this.eventBus.publish('stream:abandoned', {
-                                nodeId: this.nodeId,
-                                streamId,
-                            });
-                        }
-
                         this.emit('stream:abandoned', { streamId });
 
                         this.streamLastAccess.delete(streamId);
                         this.pendingUnusedStreams.delete(streamId);
                         this.streamClientMap.delete(streamId);
                     }
-                } catch (err) {
+                } catch {
                     this.pendingUnusedStreams.delete(streamId);
                 }
             }, this.unusedStreamDebounceDelay);
 
             this.pendingUnusedStreams.set(streamId, timer);
-        } catch (err) {
+        } catch {
             // no-op
         }
     }
@@ -547,7 +298,7 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
             try {
                 clearTimeout(this.pendingUnusedStreams.get(streamId)!);
                 this.pendingUnusedStreams.delete(streamId);
-            } catch (err) {
+            } catch {
                 this.pendingUnusedStreams.delete(streamId);
             }
         }
@@ -560,7 +311,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         const now = new Date();
 
         this.clientLastAccess.set(clientId, now);
-
         this.streamLastAccess.set(streamId, now);
 
         if (!this.clientStreamMap.has(clientId)) {
@@ -603,34 +353,6 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
             return;
         }
 
-        this.removeClientLocally(clientId);
-
-        // Remove from distributed store
-        if (this.stateStore) {
-            const clientKey = `client:${clientId}`;
-
-            void this.stateStore.delete(clientKey);
-        }
-
-        // Publish departure event
-        if (this.eventBus) {
-            void this.eventBus.publish('client:departed', {
-                nodeId: this.nodeId,
-                clientId,
-                fileId: client.fileId,
-            });
-        }
-
-        this.emit('client:departed', {
-            clientId,
-            fileId: client.fileId,
-        });
-    }
-
-    /**
-     * Remove client from local state only
-     */
-    private removeClientLocally (clientId: string): void {
         const streams = this.clientStreamMap.get(clientId) || new Set();
 
         for (const streamId of streams) {
@@ -648,6 +370,11 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         this.clientStreamMap.delete(clientId);
         this.clientLastAccess.delete(clientId);
         this.clientSegmentHistory.delete(clientId);
+
+        this.emit('client:departed', {
+            clientId,
+            fileId: client.fileId,
+        });
     }
 
     /**
@@ -683,7 +410,7 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
 
             this.states.set(clientId, newState);
             this.emit('session:updated', newState);
-        } catch (err) {
+        } catch {
             // no-op
         }
     }
@@ -711,294 +438,5 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
         }
 
         return ClientBehavior.SEEKING;
-    }
-
-    /**
-     * Check if a new job can be started based on system load
-     */
-    private canStartNewJob (load: number): boolean {
-        const maxJobs = this.calculateMaxConcurrentJobs(load);
-
-        // In distributed mode, we can't easily track active jobs across nodes
-        // So we rely more on system load
-        if (this.jobQueue) {
-            return load < this.overloadThreshold;
-        }
-
-        // Local mode - track active jobs (implementation simplified for brevity)
-        return true;
-    }
-
-    /**
-     * Calculate the maximum number of concurrent jobs based on system load
-     */
-    private calculateMaxConcurrentJobs (load: number): number {
-        if (load > 80) {
-            return Math.max(1, Math.floor(this.maxConcurrentJobs * 0.5));
-        }
-        if (load > 60) {
-            return Math.max(1, Math.floor(this.maxConcurrentJobs * 0.7));
-        }
-
-        return this.maxConcurrentJobs;
-    }
-
-    /**
-     * Update system load and emit events if significant changes
-     */
-    private updateSystemLoad (): TaskEither<void> {
-        return this.calculateSystemLoad()
-            .map((load) => {
-                const previousLoad = this.lastSystemLoad;
-
-                this.lastSystemLoad = load;
-
-                if (Math.abs(load - previousLoad) >= this.loadCheckThreshold) {
-                    this.emit('system:loadChanged', { load,
-                        previousLoad });
-                }
-
-                if (load >= this.overloadThreshold && previousLoad < this.overloadThreshold) {
-                    this.emit('system:overloaded', {
-                        load,
-                        activeClients: this.clients.size,
-                    });
-                } else if (load < this.overloadThreshold && previousLoad >= this.overloadThreshold) {
-                    this.emit('system:stable', {
-                        load,
-                        activeClients: this.clients.size,
-                    });
-                }
-            });
-    }
-
-    /**
-     * Calculates the current server load as a number between 0-100
-     * Considers CPU usage, memory pressure, and active process count
-     */
-    private calculateSystemLoad (): TaskEither<number> {
-        const WEIGHTS = {
-            cpu: 0.6,
-            memory: 0.3,
-            diskIO: 0.1,
-        };
-
-        /**
-         * Gets the current CPU usage by sampling over a short period
-         * @returns Promise resolving to CPU usage percentage (0-100)
-         */
-        const getCpuUsage = async (): Promise<number> => {
-            const initialMeasurements = os.cpus().map((cpu) => ({
-                idle: cpu.times.idle,
-                total: Object.values(cpu.times).reduce((sum: number, time: number) => sum + time, 0),
-            }));
-
-            await new Promise((resolve) => setTimeout(resolve, 200));
-
-            const finalMeasurements = os.cpus().map((cpu) => ({
-                idle: cpu.times.idle,
-                total: Object.values(cpu.times).reduce((sum: number, time: number) => sum + time, 0),
-            }));
-
-            const cpuUsages = initialMeasurements.map((start, i) => {
-                const end = finalMeasurements[i];
-                const idleDiff = end.idle - start.idle;
-                const totalDiff = end.total - start.total;
-
-
-                return Math.max(0, Math.min(100, 100 - Math.round(100 * idleDiff / totalDiff)));
-            });
-
-            return cpuUsages.reduce((sum, usage) => sum + usage, 0) / cpuUsages.length;
-        };
-
-        /**
-         * Gets the current memory usage percentage
-         * @returns Memory usage percentage (0-100)
-         */
-        const getMemoryUsage = (): number => {
-            const totalMemory = os.totalmem();
-            const freeMemory = os.freemem();
-            const usedMemory = totalMemory - freeMemory;
-
-
-            return Math.min(100, (usedMemory / totalMemory) * 100);
-        };
-
-        /**
-         * Gets the disk I/O pressure by using platform-specific commands
-         * @returns Promise resolving to disk I/O percentage (0-100)
-         */
-        const getDiskIOPressure = async (): Promise<number> => {
-            const DEFAULT_IO_VALUE = 50;
-
-            try {
-                if (process.platform === 'linux') {
-                    // eslint-disable-next-line @typescript-eslint/no-use-before-define
-                    return await getLinuxDiskIO();
-                } else if (process.platform === 'darwin') {
-                    // eslint-disable-next-line @typescript-eslint/no-use-before-define
-                    return await getMacOSDiskIO();
-                } else if (process.platform === 'win32') {
-                    // eslint-disable-next-line @typescript-eslint/no-use-before-define
-                    return await getWindowsDiskIO();
-                }
-            } catch (error) {
-                // no-op
-            }
-
-            return DEFAULT_IO_VALUE;
-        };
-
-        /**
-         * Gets disk I/O on Linux using iostat
-         */
-        const getLinuxDiskIO = (): Promise<number> => new Promise((resolve) => {
-            exec('iostat -dx 1 1', (error, stdout) => {
-                if (error) {
-                    resolve(50);
-
-                    return;
-                }
-
-                try {
-                    const lines = stdout.split('\n').filter((line) => line.trim().length > 0);
-                    const deviceLineIndex = lines.findIndex((line) => line.includes('Device'));
-
-                    if (deviceLineIndex === -1 || deviceLineIndex === lines.length - 1) {
-                        resolve(50);
-
-                        return;
-                    }
-
-                    const deviceLines = lines.slice(deviceLineIndex + 1);
-                    const utilValues = deviceLines.map((line) => {
-                        const fields = line.trim().split(/\s+/);
-
-
-                        return parseFloat(fields[fields.length - 1]);
-                    });
-
-                    const avgUtil = utilValues.reduce((sum, util) => sum + util, 0) / utilValues.length;
-
-                    resolve(Math.min(100, avgUtil));
-                } catch (e) {
-                    resolve(50);
-                }
-            });
-        });
-
-        /**
-         * Gets disk I/O on macOS using iostat
-         */
-        const getMacOSDiskIO = (): Promise<number> => new Promise((resolve) => {
-            exec('iostat -d -c 1', (error, stdout) => {
-                if (error) {
-                    resolve(50);
-
-                    return;
-                }
-
-                try {
-                    const diskLines = stdout.split('\n').filter((line) => line.includes('disk'));
-
-                    if (diskLines.length === 0) {
-                        resolve(50);
-
-                        return;
-                    }
-
-                    let totalLoad = 0;
-                    let deviceCount = 0;
-
-                    for (const line of diskLines) {
-                        const parts = line.trim().split(/\s+/);
-
-                        if (parts.length >= 4) {
-                            const tps = parseFloat(parts[2]);
-                            const kbps = parseFloat(parts[3]);
-
-                            if (!isNaN(tps) && !isNaN(kbps)) {
-                                totalLoad += Math.min(100, (tps * kbps) / 100);
-                                deviceCount++;
-                            }
-                        }
-                    }
-
-                    resolve(deviceCount > 0 ? totalLoad / deviceCount : 50);
-                } catch (e) {
-                    resolve(50);
-                }
-            });
-        });
-
-        /**
-         * Estimates disk I/O on Windows based on active processes
-         */
-        const getWindowsDiskIO = (): Promise<number> => new Promise((resolve) => {
-            try {
-                const output = execSync('tasklist /fi "imagename eq ffmpeg.exe" /fo csv /nh').toString();
-                const processCount = output.split('\n').filter((line: string) => line.includes('ffmpeg')).length;
-
-                resolve(Math.min(100, processCount * 10));
-            } catch (e) {
-                resolve(50);
-            }
-        });
-
-        /**
-         * Gets adjustment factor based on active clients
-         * @returns Client load adjustment factor (0-100)
-         */
-        const getClientLoadAdjustment = (): number => {
-            const activeClientCount = this.clients.size;
-
-            return Math.min(100, activeClientCount * 5);
-        };
-
-        /**
-         * Checks if running in a container environment
-         * @returns True if running in a container
-         */
-        const isRunningInContainer = (): boolean => {
-            try {
-                return fs.existsSync('/.dockerenv') || fs.readFileSync('/proc/1/cgroup', 'utf8').includes('docker');
-            } catch {
-                return false;
-            }
-        };
-
-        return TaskEither
-            .tryCatch(
-                async () => {
-                    const [cpuUsage, diskIOPressure] = await Promise.all([
-                        getCpuUsage(),
-                        getDiskIOPressure(),
-                    ]);
-
-                    const memoryUsage = getMemoryUsage();
-                    const clientLoad = getClientLoadAdjustment();
-
-                    const scaledCpuUsage = isRunningInContainer()
-                        ? Math.min(100, cpuUsage * 1.2)
-                        : cpuUsage;
-
-                    const cpuFactor = scaledCpuUsage / 100;
-                    const cpuWeight = WEIGHTS.cpu * (1 + 0.5 * cpuFactor);
-                    const memoryWeight = WEIGHTS.memory * (1 - 0.3 * cpuFactor);
-                    const diskWeight = WEIGHTS.diskIO * (1 - 0.3 * cpuFactor);
-                    const totalWeight = cpuWeight + memoryWeight + diskWeight;
-
-                    const systemLoad = (
-                        (scaledCpuUsage * cpuWeight) +
-                        (memoryUsage * memoryWeight) +
-                        (diskIOPressure * diskWeight)
-                    ) / totalWeight;
-
-                    return Math.min(100, (systemLoad * 0.7) + (clientLoad * 0.3));
-                },
-                'Failed to calculate system load',
-            )
-            .orElse(() => TaskEither.of(50));
     }
 }
