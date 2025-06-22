@@ -27,121 +27,121 @@ import { ISegmentProcessor, SegmentProcessingData, SegmentProcessingResult } fro
  * This is the default processor that maintains backward compatibility
  */
 export class LocalSegmentProcessor implements ISegmentProcessor {
-    private disposed = false;
+	private disposed = false;
 
-    private readonly workerId: string;
+	private readonly workerId: string;
 
-    constructor (workerId?: string) {
-        this.workerId = workerId || process.env.HOSTNAME || `local-${Date.now()}`;
-    }
+	constructor (workerId?: string) {
+		this.workerId = workerId || process.env.HOSTNAME || `local-${Date.now()}`;
+	}
 
-    async processSegment (data: SegmentProcessingData): Promise<SegmentProcessingResult> {
-        const startTime = Date.now();
+	async processSegment (data: SegmentProcessingData): Promise<SegmentProcessingResult> {
+		const startTime = Date.now();
 
-        try {
-            // Check if segment already exists
-            if (await this.segmentExists(data.outputPath)) {
-                return {
-                    success: true,
-                    segmentIndex: data.segmentIndex,
-                    outputPath: data.outputPath,
-                    cached: true,
-                    processingTime: Date.now() - startTime,
-                };
-            }
+		try {
+			// Check if segment already exists
+			if (await this.segmentExists(data.outputPath)) {
+				return {
+					success: true,
+					segmentIndex: data.segmentIndex,
+					outputPath: data.outputPath,
+					cached: true,
+					processingTime: Date.now() - startTime,
+				};
+			}
 
-            // Process the segment using FFmpeg
-            await this.runFFmpeg(data);
+			// Process the segment using FFmpeg
+			await this.runFFmpeg(data);
 
-            return {
-                success: true,
-                segmentIndex: data.segmentIndex,
-                outputPath: data.outputPath,
-                processingTime: Date.now() - startTime,
-            };
-        } catch (error) {
-            return {
-                success: false,
-                segmentIndex: data.segmentIndex,
-                outputPath: data.outputPath,
-                processingTime: Date.now() - startTime,
-                error: error as Error,
-            };
-        }
-    }
+			return {
+				success: true,
+				segmentIndex: data.segmentIndex,
+				outputPath: data.outputPath,
+				processingTime: Date.now() - startTime,
+			};
+		} catch (error) {
+			return {
+				success: false,
+				segmentIndex: data.segmentIndex,
+				outputPath: data.outputPath,
+				processingTime: Date.now() - startTime,
+				error: error as Error,
+			};
+		}
+	}
 
-    private async runFFmpeg (data: SegmentProcessingData): Promise<void> {
-        const { inputOptions, outputOptions, videoFilters } = data.ffmpegOptions;
+	private async runFFmpeg (data: SegmentProcessingData): Promise<void> {
+		const { inputOptions, outputOptions, videoFilters } = data.ffmpegOptions;
 
-        // Ensure output directory exists (async)
-        const outputDir = path.dirname(data.outputPath);
+		// Ensure output directory exists (async)
+		const outputDir = path.dirname(data.outputPath);
 
-        await fs.promises.mkdir(outputDir, { recursive: true });
+		await fs.promises.mkdir(outputDir, { recursive: true });
 
-        // Create temp file path with worker ID to avoid collisions
-        const tempPath = `${data.outputPath}.${this.workerId}.tmp`;
+		// Create temp file path with worker ID to avoid collisions
+		const tempPath = `${data.outputPath}.${this.workerId}.tmp`;
 
-        return new Promise((resolve, reject) => {
-            const command = ffmpeg(data.sourceFilePath)
-                .inputOptions(inputOptions)
-                .outputOptions(outputOptions)
-                .output(tempPath);
+		return new Promise((resolve, reject) => {
+			const command = ffmpeg(data.sourceFilePath)
+				.inputOptions(inputOptions)
+				.outputOptions(outputOptions)
+				.output(tempPath);
 
-            if (videoFilters) {
-                command.videoFilters(videoFilters);
-            }
+			if (videoFilters) {
+				command.videoFilters(videoFilters);
+			}
 
-            command.on('end', async () => {
-                try {
-                    // Atomic rename from temp to final path
-                    await fs.promises.rename(tempPath, data.outputPath);
-                    resolve();
-                } catch (renameError: any) {
-                    // If rename fails due to file already existing, that's ok
-                    if (renameError.code === 'EEXIST') {
-                        console.log(`Segment ${data.segmentIndex} already exists (lost race to another worker)`);
-                        // Clean up our temp file
-                        await fs.promises.unlink(tempPath).catch(() => {});
-                        resolve();
-                    } else {
-                        reject(renameError);
-                    }
-                }
-            });
-            command.on('error', async (err) => {
-                // Attempt to clean up temp file on error
-                try {
-                    await fs.promises.unlink(tempPath);
-                } catch (unlinkError) {
-                    // Ignore unlink errors - file may not exist
-                }
-                reject(err);
-            });
+			command.on('end', async () => {
+				try {
+					// Atomic rename from temp to final path
+					await fs.promises.rename(tempPath, data.outputPath);
+					resolve();
+				} catch (renameError: any) {
+					// If rename fails due to file already existing, that's ok
+					if (renameError.code === 'EEXIST') {
+						console.log(`Segment ${data.segmentIndex} already exists (lost race to another worker)`);
+						// Clean up our temp file
+						await fs.promises.unlink(tempPath).catch(() => {});
+						resolve();
+					} else {
+						reject(renameError);
+					}
+				}
+			});
+			command.on('error', async (err) => {
+				// Attempt to clean up temp file on error
+				try {
+					await fs.promises.unlink(tempPath);
+				} catch (unlinkError) {
+					// Ignore unlink errors - file may not exist
+				}
+				reject(err);
+			});
 
-            command.run();
-        });
-    }
+			command.run();
+		});
+	}
 
-    private async segmentExists (filePath: string): Promise<boolean> {
-        try {
-            await fs.promises.access(filePath);
+	private async segmentExists (filePath: string): Promise<boolean> {
+		try {
+			await fs.promises.access(filePath);
 
-            return true;
-        } catch {
-            return false;
-        }
-    }
+			return true;
+		} catch {
+			return false;
+		}
+	}
 
-    async isHealthy (): Promise<boolean> {
-        // Local processor is always healthy
-        return !this.disposed;
-    }
+	async isHealthy (): Promise<boolean> {
+		// Local processor is always healthy
+		return !this.disposed;
+	}
 
-    getMode (): 'local' | 'distributed' {
-        return 'local';
-    }
+	getMode (): 'local' | 'distributed' {
+		return 'local';
+	}
 
-    async dispose (): Promise<void> {
-        this.disposed = true;
-    }
+	async dispose (): Promise<void> {
+		this.disposed = true;
+	}
 }
