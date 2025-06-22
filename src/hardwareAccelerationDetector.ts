@@ -22,6 +22,7 @@ import { promisify } from 'util';
 
 import { createBadRequestError, createInternalError, TaskEither } from '@eleven-am/fp';
 
+import { HardwareOptimizer } from './hardwareOptimizer';
 import { CodecType, FFMPEGOptions, HardwareAccelerationConfig, HardwareAccelerationMethod } from './types';
 
 const execAsync = promisify(exec);
@@ -69,30 +70,78 @@ export class HardwareAccelerationDetector {
      * @param codec Target codec (h264 or h265)
      * @returns Object with inputOptions, outputOptions, and videoFilters
      */
-	applyHardwareConfig (hwConfig: HardwareAccelerationConfig | null, width: number, height: number, codec: CodecType = 'h264'): FFMPEGOptions {
+	applyHardwareConfig (
+		hwConfig: HardwareAccelerationConfig | null,
+		width: number,
+		height: number,
+		codec: CodecType = 'h264',
+		frameRate = 30,
+		bitrate = 4000000,
+		isLiveStream = false,
+	): FFMPEGOptions {
 		hwConfig = hwConfig || this.getSoftwareConfig();
-		const outputOptions = hwConfig.outputOptions[codec] || hwConfig.outputOptions['h264'];
 
-		let videoFilters = '';
+		// Use hardware optimizer for optimal settings
+		const optimizer = new HardwareOptimizer();
+		const optimizedSettingsEither = optimizer.getOptimalSettings({
+			method: hwConfig.method,
+			codec,
+			width,
+			height,
+			frameRate,
+			bitrate,
+			isLiveStream,
+		});
 
-		if (hwConfig.videoFilters.scale) {
+		// Extract the value from Either
+		const optimizedSettings = optimizedSettingsEither.toValue();
+
+		// Merge with existing config
+		const baseOutputOptions = hwConfig.outputOptions[codec] || hwConfig.outputOptions['h264'];
+
+		// Combine options, with optimized settings taking precedence
+		const outputOptions = [
+			...baseOutputOptions,
+			...optimizedSettings.outputOptions.filter((opt) => {
+				// Filter out duplicate options
+				const optKey = opt.split(' ')[0];
+
+				return !baseOutputOptions.some((baseOpt) => baseOpt.startsWith(optKey));
+			}),
+		];
+
+		let videoFilters = optimizedSettings.videoFilters || '';
+
+		// Add scale filter if needed
+		if (hwConfig.videoFilters.scale && !videoFilters.includes('scale')) {
 			const scaleFilter = hwConfig.videoFilters.scale
 				.replace('%width%', width.toString())
 				.replace('%height%', height.toString());
 
+			if (videoFilters) {
+				videoFilters += ',';
+			}
 			videoFilters += scaleFilter;
 		}
 
-		if (hwConfig.videoFilters.deinterlace) {
+		// Add deinterlace if needed
+		if (hwConfig.videoFilters.deinterlace && !videoFilters.includes('deinterlace')) {
 			if (videoFilters) {
 				videoFilters += ',';
 			}
 			videoFilters += hwConfig.videoFilters.deinterlace;
 		}
 
+		// Get optimal thread count for software encoding
+		const threadCount = optimizer.getOptimalThreadCount(width, height, hwConfig.method);
+
+		const finalOutputOptions = threadCount
+			? [...outputOptions, '-threads', threadCount.toString()]
+			: outputOptions;
+
 		return {
-			inputOptions: hwConfig.inputOptions,
-			outputOptions,
+			inputOptions: [...hwConfig.inputOptions, ...optimizedSettings.inputOptions],
+			outputOptions: finalOutputOptions,
 			videoFilters,
 		};
 	}

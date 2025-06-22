@@ -175,6 +175,36 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
 		this.updateClientSession(clientInfo.clientId);
 	}
 
+	// Pure helper functions for priority calculation
+	private getBehaviorBonus = (behavior: ClientBehavior): number => {
+		const bonuses = {
+			[ClientBehavior.FIRST_TIME]: 30,
+			[ClientBehavior.SEEKING]: 20,
+			[ClientBehavior.SEQUENTIAL]: 5,
+		};
+		return bonuses[behavior] || 0;
+	};
+
+	private getVideoQualityAdjustment = (quality: string): number => {
+		const qualityInfo = this.qualityService.parseVideoQuality(quality);
+		return qualityInfo.value === 'original' ? -10 : this.getHeightBonus(qualityInfo.height);
+	};
+
+	private getHeightBonus = (height: number): number => {
+		if (height <= 480) return 10;
+		if (height <= 720) return 5;
+		return 0;
+	};
+
+	private getQualityAdjustment = (type: StreamType, quality: string): number => 
+		type === StreamType.VIDEO ? this.getVideoQualityAdjustment(quality) : 0;
+
+	private clampPriority = (priority: number): number => 
+		Math.max(1, Math.min(100, priority));
+
+	private calculateFinalPriority = (basePriority: number, behaviorBonus: number, qualityAdjustment: number): number =>
+		this.clampPriority(basePriority + behaviorBonus + qualityAdjustment);
+
 	/**
      * Get the priority for a stream request
      * @param clientId The ID of the client requesting the stream
@@ -184,52 +214,26 @@ export class ClientTracker extends ExtendedEventEmitter<ClientTrackerEvents> {
      * @returns A TaskEither containing the calculated priority (higher = more important)
      */
 	public getPriority (clientId: string, type: StreamType, quality: string, segmentIndex: number): TaskEither<number> {
-		const fileId = this.clients.get(clientId)?.fileId;
-
-		if (!fileId) {
-			return TaskEither.of(0);
-		}
-
-		const behavior = this.analyzeClientBehavior(clientId, segmentIndex);
-
 		const BASE_PRIORITY = 50;
-		const FIRST_TIME_BONUS = 30;
-		const SEEKING_BONUS = 20;
-		const SEQUENTIAL_BONUS = 5;
 
-		let priority = BASE_PRIORITY;
+		const getClientFileId = () => this.clients.get(clientId)?.fileId;
+		
+		const analyzeBehavior = () => this.analyzeClientBehavior(clientId, segmentIndex);
+		
+		const buildPriorityData = (behavior: ClientBehavior) => ({
+			behaviorBonus: this.getBehaviorBonus(behavior),
+			qualityAdjustment: this.getQualityAdjustment(type, quality),
+		});
+		
+		const calculatePriority = ({ behaviorBonus, qualityAdjustment }: { behaviorBonus: number; qualityAdjustment: number }) => 
+			this.calculateFinalPriority(BASE_PRIORITY, behaviorBonus, qualityAdjustment);
 
-		switch (behavior) {
-			case ClientBehavior.FIRST_TIME:
-				priority += FIRST_TIME_BONUS;
-				break;
-			case ClientBehavior.SEEKING:
-				priority += SEEKING_BONUS;
-				break;
-			case ClientBehavior.SEQUENTIAL:
-				priority += SEQUENTIAL_BONUS;
-				break;
-			default:
-				break;
-		}
-
-		// Adjust priority based on quality
-		if (type === StreamType.VIDEO) {
-			const qualityInfo = this.qualityService.parseVideoQuality(quality);
-
-			if (qualityInfo.value === 'original') {
-				priority -= 10;
-			} else {
-				// Prioritize lower qualities slightly for better user experience
-				const heightFactor = qualityInfo.height <= 480
-					? 10 :
-					qualityInfo.height <= 720 ? 5 : 0;
-
-				priority += heightFactor;
-			}
-		}
-
-		return TaskEither.of(Math.max(1, Math.min(100, priority)));
+		return TaskEither
+			.fromNullable(getClientFileId())
+			.map(analyzeBehavior)
+			.map(buildPriorityData)
+			.map(calculatePriority)
+			.orElse(() => TaskEither.of(0));
 	}
 
 	/**

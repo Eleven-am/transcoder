@@ -19,6 +19,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 
+import { createInternalError, TaskEither } from '@eleven-am/fp';
 import { RedisClientType } from 'redis';
 
 import {
@@ -75,146 +76,59 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 	}
 
 	async processSegment (data: SegmentProcessingData): Promise<SegmentProcessingResult> {
-		let claim: SegmentClaim | null = null;
 		let renewalTimer: NodeJS.Timeout | null = null;
+		let claim: SegmentClaim | null = null;
 
-		try {
-			// Check if segment is already completed
-			if (await this.segmentExists(data.outputPath)) {
-				return {
-					success: true,
-					segmentIndex: data.segmentIndex,
-					outputPath: data.outputPath,
-					cached: true,
-				};
-			}
-
-			// Check Redis for completion status
-			const isCompleted = await this.claimManager.isSegmentCompleted(
-				data.fileId,
-				data.streamType,
-				data.quality,
-				data.streamIndex,
-				data.segmentIndex,
-			);
-
-			if (isCompleted) {
-				// Wait for file to appear on disk (may be processing on another node)
-				const fileAppeared = await this.waitForFile(data.outputPath, this.fileWaitTimeout);
-
-				return {
-					success: fileAppeared,
-					segmentIndex: data.segmentIndex,
-					outputPath: data.outputPath,
-					cached: true,
-					error: fileAppeared ? undefined : new Error('Segment marked complete but file not found'),
-				};
-			}
-
-			// Try to claim the segment
-			claim = await this.claimManager.claimSegment(
-				data.fileId,
-				data.streamType,
-				data.quality,
-				data.streamIndex,
-				data.segmentIndex,
-			);
-
-			if (!claim.acquired) {
-				// Another worker has the claim, wait for completion
-				return await this.waitForSegmentCompletion(data);
-			}
-
-			// We have the claim, set up automatic renewal
-			renewalTimer = setInterval(async () => {
-				try {
-					const extended = await claim!.extend();
-
-					if (!extended) {
-						console.warn(`Failed to extend claim for segment ${data.segmentIndex}`);
-					}
-				} catch (error) {
-					console.error(`Error extending claim for segment ${data.segmentIndex}:`, error);
-				}
-			}, this.claimRenewalInterval);
-
-			this.activeRenewals.set(claim.segmentKey, renewalTimer);
-
-			// Process the segment locally
-			const result = await this.localProcessor.processSegment(data);
-
-			if (result.success) {
-				// Mark as completed in Redis
-				await this.claimManager.markSegmentCompleted(
-					data.fileId,
-					data.streamType,
-					data.quality,
-					data.streamIndex,
-					data.segmentIndex,
-				);
-
-				// Notify waiting workers
-				await this.claimManager.publishSegmentComplete(
-					data.fileId,
-					data.streamType,
-					data.quality,
-					data.streamIndex,
-					data.segmentIndex,
-				);
-			}
-
-			return result;
-		} catch (error) {
-			// Handle Redis connection errors by falling back to local
-			if (this.fallbackToLocal && this.isRedisError(error)) {
-				console.warn('Redis error, falling back to local processing:', error);
-
-				return await this.localProcessor.processSegment(data);
-			}
-
-			return {
-				success: false,
-				segmentIndex: data.segmentIndex,
-				outputPath: data.outputPath,
-				error: error as Error,
-			};
-		} finally {
-			// Clean up
-			if (renewalTimer) {
-				clearInterval(renewalTimer);
-				if (claim?.segmentKey) {
-					this.activeRenewals.delete(claim.segmentKey);
-				}
-			}
-
-			if (claim?.acquired) {
-				try {
-					await claim.release();
-				} catch (err) {
-					console.error('CRITICAL: Failed to release claim during cleanup:', {
-						segmentKey: claim.segmentKey,
-						workerId: this.workerId,
-						error: err,
-					});
-					// Do not re-throw - the claim will expire via TTL
-				}
-			}
-		}
+		return this.checkSegmentExistsOnDisk(data.outputPath)
+			.matchTask([
+				{
+					predicate: (exists) => exists,
+					run: () => TaskEither.of(this.createCachedResult(data)),
+				},
+				{
+					predicate: () => true,
+					run: () => this.checkRedisCompletionStatus(data)
+						.matchTask([
+							{
+								predicate: (isCompleted) => isCompleted,
+								run: () => this.waitForFileTask(data.outputPath, this.fileWaitTimeout)
+									.map(fileAppeared =>
+										fileAppeared
+											? this.createCachedResult(data)
+											: this.createFileNotFoundResult(data),
+									),
+							},
+							{
+								predicate: () => true,
+								run: () => this.claimSegmentTask(data)
+									.ioSync(c => { claim = c; })
+									.matchTask([
+										{
+											predicate: (c) => !c.acquired,
+											run: () => this.waitForSegmentCompletionTask(data),
+										},
+										{
+											predicate: (c) => c.acquired,
+											run: (c) => this.setupClaimRenewal(c, data.segmentIndex)
+												.ioSync(timer => { renewalTimer = timer; })
+												.chain(() => this.processSegmentLocally(data))
+												.chain(result => this.handleSuccessfulProcessing(data, result)),
+										},
+									]),
+							},
+						]),
+				},
+			])
+			.orElse((error) => this.handleRedisErrorWithFallback(error, data))
+			.io(() => this.cleanupClaimAndTimer(claim, renewalTimer))
+			.toPromise();
 	}
 
 	async isHealthy (): Promise<boolean> {
-		if (this.disposed) {
-			return false;
-		}
-
-		try {
-			await this.redis.ping();
-
-			return true;
-		} catch {
-			// If Redis is down but fallback is enabled, we're still "healthy"
-			return this.fallbackToLocal;
-		}
+		return this.checkRedisConnection()
+			.map(redisAvailable => this.determineHealthStatus(this.disposed, redisAvailable))
+			.orElse(() => TaskEither.of(this.determineHealthStatus(this.disposed, false)))
+			.toPromise();
 	}
 
 	getMode (): 'local' | 'distributed' {
@@ -234,114 +148,380 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 		await this.localProcessor.dispose();
 	}
 
-	private async waitForSegmentCompletion (data: SegmentProcessingData): Promise<SegmentProcessingResult> {
-		const startTime = Date.now();
-		let unsubscribe: (() => Promise<void>) | null = null;
-		let checkInterval: NodeJS.Timeout | null = null;
-		let segmentCompleted = false;
+	/**
+	 * Get all currently claimed segments
+	 * Public method for work stealing processor
+	 */
+	async getClaimedSegments (): Promise<Array<{
+		segmentKey: string;
+		workerId: string;
+		claimTime: number;
+		expiresAt: number;
+		outputPath: string;
+	}>> {
+		return this.claimManager.getClaimedSegments();
+	}
 
-		const cleanup = async () => {
-			if (checkInterval) {
-				clearInterval(checkInterval);
-			}
-			if (unsubscribe) {
+	/**
+	 * Force claim a segment
+	 * Public method for work stealing processor
+	 */
+	async forceClaimSegment (
+		segmentKey: string,
+		workerId: string,
+		outputPath?: string,
+	): Promise<boolean> {
+		return this.claimManager.forceClaimSegment(segmentKey, workerId, outputPath);
+	}
+
+	/**
+	 * Get the claim manager instance
+	 * Public method for work stealing processor
+	 */
+	getClaimManager (): RedisSegmentClaimManager {
+		return this.claimManager;
+	}
+
+	// Pure helper functions for segment processing
+	private createCachedResult = (data: SegmentProcessingData): SegmentProcessingResult => ({
+		success: true,
+		segmentIndex: data.segmentIndex,
+		outputPath: data.outputPath,
+		cached: true,
+	});
+
+	private createFileNotFoundResult = (data: SegmentProcessingData): SegmentProcessingResult => ({
+		success: false,
+		segmentIndex: data.segmentIndex,
+		outputPath: data.outputPath,
+		cached: true,
+		error: new Error('Segment marked complete but file not found'),
+	});
+
+	private checkSegmentExistsOnDisk = (outputPath: string): TaskEither<boolean> =>
+		TaskEither.tryCatch(
+			() => this.segmentExists(outputPath),
+			'Failed to check segment existence',
+		);
+
+	private checkRedisCompletionStatus = (data: SegmentProcessingData): TaskEither<boolean> =>
+		TaskEither.tryCatch(
+			() => this.claimManager.isSegmentCompleted(
+				data.fileId,
+				data.streamType,
+				data.quality,
+				data.streamIndex,
+				data.segmentIndex,
+			),
+			'Failed to check completion status',
+		);
+
+	private waitForFileTask = (outputPath: string, timeout: number): TaskEither<boolean> =>
+		TaskEither.tryCatch(
+			() => this.waitForFile(outputPath, timeout),
+			'Failed to wait for file',
+		);
+
+	private claimSegmentTask = (data: SegmentProcessingData): TaskEither<SegmentClaim> =>
+		TaskEither.tryCatch(
+			() => this.claimManager.claimSegment(
+				data.fileId,
+				data.streamType,
+				data.quality,
+				data.streamIndex,
+				data.segmentIndex,
+				data.outputPath,
+			),
+			'Failed to claim segment',
+		);
+
+	private setupClaimRenewal = (claim: SegmentClaim, segmentIndex: number): TaskEither<NodeJS.Timeout> =>
+		TaskEither.of(null).map(() => {
+			const timer = setInterval(async () => {
 				try {
-					await unsubscribe();
+					const extended = await claim.extend();
+					if (!extended) {
+						console.warn(`Failed to extend claim for segment ${segmentIndex}`);
+					}
+				} catch (error) {
+					console.error(`Error extending claim for segment ${segmentIndex}:`, error);
+				}
+			}, this.claimRenewalInterval);
+
+			this.activeRenewals.set(claim.segmentKey, timer);
+			return timer;
+		});
+
+	private processSegmentLocally = (data: SegmentProcessingData): TaskEither<SegmentProcessingResult> =>
+		TaskEither.tryCatch(
+			() => this.localProcessor.processSegment(data),
+			'Failed to process segment locally',
+		);
+
+	private markSegmentComplete = (data: SegmentProcessingData): TaskEither<void> =>
+		TaskEither.tryCatch(
+			() => this.claimManager.markSegmentCompleted(
+				data.fileId,
+				data.streamType,
+				data.quality,
+				data.streamIndex,
+				data.segmentIndex,
+			),
+			'Failed to mark segment complete',
+		);
+
+	private publishSegmentComplete = (data: SegmentProcessingData): TaskEither<void> =>
+		TaskEither.tryCatch(
+			() => this.claimManager.publishSegmentComplete(
+				data.fileId,
+				data.streamType,
+				data.quality,
+				data.streamIndex,
+				data.segmentIndex,
+			),
+			'Failed to publish completion',
+		);
+
+	private handleSuccessfulProcessing = (data: SegmentProcessingData, result: SegmentProcessingResult): TaskEither<SegmentProcessingResult> =>
+		result.success
+			? this.markSegmentComplete(data)
+				.chain(() => this.publishSegmentComplete(data))
+				.map(() => result)
+			: TaskEither.of(result);
+
+	private waitForSegmentCompletionTask = (data: SegmentProcessingData): TaskEither<SegmentProcessingResult> =>
+		TaskEither.tryCatch(
+			() => this.waitForSegmentCompletion(data),
+			'Failed to wait for segment completion',
+		);
+
+	// Pure helper function to clean up claim and renewal timer
+	private cleanupClaimAndTimer = (claim: SegmentClaim | null, renewalTimer: NodeJS.Timeout | null): TaskEither<void> => {
+		const cleanupTimer = () => {
+			if (renewalTimer) {
+				clearInterval(renewalTimer);
+				if (claim?.segmentKey) {
+					this.activeRenewals.delete(claim.segmentKey);
+				}
+			}
+		};
+
+		const releaseClaim = async () => {
+			if (claim?.acquired) {
+				try {
+					await claim.release();
+				} catch (err) {
+					console.error('CRITICAL: Failed to release claim during cleanup:', {
+						segmentKey: claim.segmentKey,
+						workerId: this.workerId,
+						error: err,
+					});
+					// Do not re-throw - the claim will expire via TTL
+				}
+			}
+		};
+
+		return TaskEither.of(undefined)
+			.ioSync(cleanupTimer)
+			.io(() => TaskEither.tryCatch(
+				() => releaseClaim(),
+				'Failed to release claim',
+			).orElse(() => TaskEither.of(undefined)));
+	};
+
+	// Pure helper function to handle Redis errors with fallback
+	private handleRedisErrorWithFallback = (error: any, data: SegmentProcessingData): TaskEither<SegmentProcessingResult> => {
+		const errorObj = error.error || error;
+		if (this.fallbackToLocal && this.isRedisError(errorObj)) {
+			console.warn('Redis error, falling back to local processing:', errorObj);
+			return TaskEither.tryCatch(
+				() => this.localProcessor.processSegment(data),
+				'Local processing failed',
+			);
+		}
+		return TaskEither.of({
+			success: false,
+			segmentIndex: data.segmentIndex,
+			outputPath: data.outputPath,
+			error: new Error(errorObj.message || 'Unknown error'),
+		});
+	};
+
+	private checkRedisConnection = (): TaskEither<boolean> =>
+		TaskEither.tryCatch(
+			() => this.redis.ping().then(() => true),
+			'Redis connection failed',
+		);
+
+	private determineHealthStatus = (disposed: boolean, redisAvailable: boolean): boolean => {
+		if (disposed) return false;
+		return redisAvailable || this.fallbackToLocal;
+	};
+
+	// Helper functions for waitForSegmentCompletion
+	private createCompletionState = () => ({
+		startTime: Date.now(),
+		unsubscribe: null as (() => Promise<void>) | null,
+		checkInterval: null as NodeJS.Timeout | null,
+		segmentCompleted: false,
+	});
+
+	private cleanupSubscriptions = (state: { unsubscribe: (() => Promise<void>) | null; checkInterval: NodeJS.Timeout | null }): TaskEither<void> => {
+		const clearTimer = () => {
+			if (state.checkInterval) {
+				clearInterval(state.checkInterval);
+			}
+		};
+
+		const unsubscribe = async () => {
+			if (state.unsubscribe) {
+				try {
+					await state.unsubscribe();
 				} catch (err) {
 					console.error('Error during unsubscribe in cleanup:', err);
 				}
 			}
 		};
 
-		try {
-			// Subscribe to completion events
-			unsubscribe = await this.claimManager.subscribeToSegmentComplete(
+		return TaskEither.of(undefined)
+			.ioSync(clearTimer)
+			.io(() => TaskEither.tryCatch(
+				() => unsubscribe(),
+				'Failed to unsubscribe',
+			).orElse(() => TaskEither.of(undefined)));
+	};
+
+	private subscribeToCompletion = (data: SegmentProcessingData, state: { segmentCompleted: boolean; checkInterval: NodeJS.Timeout | null }): TaskEither<() => Promise<void>> =>
+		TaskEither.tryCatch(
+			() => this.claimManager.subscribeToSegmentComplete(
 				data.fileId,
 				data.streamType,
 				data.quality,
 				data.streamIndex,
 				data.segmentIndex,
-				() => {
-					segmentCompleted = true;
-				},
-			);
+				() => { state.segmentCompleted = true; },
+			),
+			'Failed to subscribe to completion',
+		);
+
+	private createPeriodicFileCheck = (data: SegmentProcessingData, state: { segmentCompleted: boolean; checkInterval: NodeJS.Timeout | null }): Promise<boolean> =>
+		new Promise<boolean>((resolve) => {
+			const checkFile = async () => {
+				if (state.segmentCompleted || await this.segmentExists(data.outputPath)) {
+					if (state.checkInterval) {
+						clearInterval(state.checkInterval);
+					}
+					resolve(true);
+				}
+			};
+
+			// Check immediately
+			checkFile();
+			// Then check periodically
+			state.checkInterval = setInterval(checkFile, 1000);
+		});
+
+	private createTimeoutPromise = (timeout: number): Promise<boolean> =>
+		new Promise<boolean>((resolve) => {
+			setTimeout(() => resolve(false), timeout);
+		});
+
+	private createSuccessResult = (data: SegmentProcessingData, startTime: number): SegmentProcessingResult => ({
+		success: true,
+		segmentIndex: data.segmentIndex,
+		outputPath: data.outputPath,
+		cached: true,
+		processingTime: Date.now() - startTime,
+	});
+
+	private createTimeoutResult = (data: SegmentProcessingData, startTime: number): SegmentProcessingResult => ({
+		success: false,
+		segmentIndex: data.segmentIndex,
+		outputPath: data.outputPath,
+		error: new Error(`Timeout waiting for segment ${data.segmentIndex} after ${this.segmentTimeout}ms`),
+		processingTime: Date.now() - startTime,
+	});
+
+	private createErrorResult = (data: SegmentProcessingData, error: Error, startTime: number): SegmentProcessingResult => ({
+		success: false,
+		segmentIndex: data.segmentIndex,
+		outputPath: data.outputPath,
+		error,
+		processingTime: Date.now() - startTime,
+	});
+
+	private async waitForSegmentCompletion (data: SegmentProcessingData): Promise<SegmentProcessingResult> {
+		const state = this.createCompletionState();
+
+		try {
+			// Subscribe to completion events
+			state.unsubscribe = await this.subscribeToCompletion (data, state).toPromise ();
 
 			// Set up periodic file check
-			const checkPromise = new Promise<boolean>((resolve) => {
-				const checkFile = async () => {
-					if (segmentCompleted || await this.segmentExists(data.outputPath)) {
-						clearInterval(checkInterval!);
-						resolve(true);
-					}
-				};
-
-				// Check immediately
-				checkFile();
-
-				// Then check periodically
-				checkInterval = setInterval(checkFile, 1000);
-			});
+			const checkPromise = this.createPeriodicFileCheck(data, state);
 
 			// Wait for either completion or timeout
-			const timeoutPromise = new Promise<boolean>((resolve) => {
-				setTimeout(() => resolve(false), this.segmentTimeout);
-			});
+			const timeoutPromise = this.createTimeoutPromise(this.segmentTimeout);
 
 			const completed = await Promise.race([checkPromise, timeoutPromise]);
 
-			await cleanup();
+			await this.cleanupSubscriptions(state).toPromise();
 
 			if (completed) {
-				return {
-					success: true,
-					segmentIndex: data.segmentIndex,
-					outputPath: data.outputPath,
-					cached: true,
-					processingTime: Date.now() - startTime,
-				};
+				return this.createSuccessResult(data, state.startTime);
 			}
 
-			return {
-				success: false,
-				segmentIndex: data.segmentIndex,
-				outputPath: data.outputPath,
-				error: new Error(`Timeout waiting for segment ${data.segmentIndex} after ${this.segmentTimeout}ms`),
-				processingTime: Date.now() - startTime,
-			};
+			return this.createTimeoutResult(data, state.startTime);
 		} catch (error) {
-			await cleanup();
+			await this.cleanupSubscriptions(state).toPromise();
 
-			return {
-				success: false,
-				segmentIndex: data.segmentIndex,
-				outputPath: data.outputPath,
-				error: error as Error,
-				processingTime: Date.now() - startTime,
-			};
+			return this.createErrorResult(data, error as Error, state.startTime);
 		}
 	}
+
+	private delay = (ms: number): TaskEither<void> =>
+		TaskEither.tryCatch(
+			() => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+			'Delay failed',
+		);
+
+	private checkFileWithRetry = (filePath: string, startTime: number, timeout: number): TaskEither<boolean> =>
+		TaskEither.of(Date.now() - startTime)
+			.chain(elapsed =>
+				elapsed < timeout
+					? TaskEither.of(elapsed)
+					: TaskEither.error(createInternalError('Timeout waiting for file')),
+			)
+			.chain(() => this.checkSegmentExistsOnDisk(filePath))
+			.matchTask([
+				{
+					predicate: exists => exists,
+					run: () => TaskEither.of(true),
+				},
+				{
+					predicate: () => true,
+					run: () => this.delay(100)
+						.chain(() => this.checkFileWithRetry(filePath, startTime, timeout)),
+				},
+			])
+			.orElse(() => TaskEither.of(false));
 
 	private async waitForFile (filePath: string, timeout: number): Promise<boolean> {
 		const startTime = Date.now();
-
-		while (Date.now() - startTime < timeout) {
-			if (await this.segmentExists(filePath)) {
-				return true;
-			}
-			await new Promise((resolve) => setTimeout(resolve, 100));
-		}
-
-		return false;
+		return this.checkFileWithRetry(filePath, startTime, timeout).toPromise();
 	}
 
-	private async segmentExists (filePath: string): Promise<boolean> {
-		try {
-			await fs.promises.access(filePath);
+	private checkFileAccess = (filePath: string): TaskEither<boolean> =>
+		TaskEither.tryCatch(
+			() => fs.promises.access(filePath).then(() => true),
+			'File access failed',
+		)
+			.orElse(() => TaskEither.of(false));
 
-			return true;
-		} catch {
-			return false;
-		}
+	private async segmentExists (filePath: string): Promise<boolean> {
+		return this.checkFileAccess(filePath)
+			.orElse(() => TaskEither.of(false))
+			.toPromise();
 	}
 
 	private isRedisError (error: unknown): boolean {

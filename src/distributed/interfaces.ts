@@ -69,7 +69,7 @@ export interface ISegmentProcessor {
     /**
      * Get current processing mode
      */
-    getMode(): 'local' | 'distributed';
+    getMode(): string;
 
     /**
      * Cleanup resources
@@ -101,4 +101,9 @@ export interface DistributedConfig {
     fallbackToLocal?: boolean;
     completedSegmentTTL?: number; // milliseconds - how long to keep completed segment records in Redis
     fileWaitTimeout?: number; // milliseconds - how long to wait for files to appear on shared storage
+    // Work stealing configuration
+    enableWorkStealing?: boolean;
+    stealThreshold?: number; // milliseconds before considering a segment stuck
+    stealCheckInterval?: number; // how often to check for stuck segments
+    maxStealsPerCheck?: number; // max segments to steal per check
 }

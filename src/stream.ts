@@ -27,6 +27,7 @@ import { JobProcessor } from './jobProcessor';
 import { MediaSource } from './mediaSource';
 import { MetadataService } from './metadataService';
 import { QualityService } from './qualityService';
+import { SegmentPipelineProcessor } from './segmentPipelineProcessor';
 import {
 	AudioQuality,
 	AudioQualityEnum,
@@ -63,6 +64,8 @@ interface StreamEventMap {
     'transcode:fallback': { job: TranscodeJob, from: string, to: string };
     'stream:metrics': StreamMetricsEvent;
     'dispose': { id: string };
+    'segment:processed': { segmentNumber: number, processingTime: number };
+    'pipeline:metrics': any;
 }
 
 enum JobRangeStatus {
@@ -113,6 +116,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 
 	private readonly segmentRetries: Map<number, number>;
 
+	private readonly pipelineProcessor: SegmentPipelineProcessor;
+
 	private timer: NodeJS.Timeout | null;
 
 	private hasFallenBackToSoftware: boolean;
@@ -156,6 +161,7 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 		this.metricsTimer = null;
 		this.cachedHwOptions = new Map();
 		this.segmentRetries = new Map();
+		this.pipelineProcessor = new SegmentPipelineProcessor(this.getDynamicPipelineDepth());
 		this.metrics = {
 			segmentsProcessed: 0,
 			segmentsFailed: 0,
@@ -165,6 +171,15 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 			totalJobsStarted: 0,
 			totalJobsCompleted: 0,
 		};
+
+		// Hook up pipeline events
+		this.pipelineProcessor.on('segment:completed', ({ segmentNumber, processingTime }) => {
+			this.emit('segment:processed', { segmentNumber, processingTime });
+		});
+
+		this.pipelineProcessor.on('pipeline:updated', (metrics) => {
+			this.emit('pipeline:metrics', metrics);
+		});
 	}
 
 	/**
@@ -470,6 +485,8 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 		this.cachedHwOptions.clear();
 		this.segmentRetries.clear();
 
+		// Clear pipeline processor
+		this.pipelineProcessor.clear();
 
 		this.jobRange.forEach((range) => {
 			if (range.status === JobRangeStatus.PROCESSING) {
@@ -620,6 +637,19 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	}
 
 	/**
+	 * Get dynamic pipeline depth based on hardware acceleration and system resources
+	 */
+	private getDynamicPipelineDepth (): number {
+		// Higher pipeline depth for hardware acceleration
+		if (this.isUsingHardwareAcceleration()) {
+			return 4; // Can handle more concurrent segments with GPU
+		}
+
+		// Conservative depth for software encoding
+		return 2;
+	}
+
+	/**
      * Get cached hardware acceleration options
      * Uses optimisedAccel unless we've fallen back to software
      * @param width - Video width
@@ -631,11 +661,19 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 		const key = `${width}x${height}-${codec}-${hwConfigToUse?.method || 'software'}`;
 
 		if (!this.cachedHwOptions.has(key)) {
+			// Get video info for frame rate and bitrate
+			const video = this.metadata.videos[this.streamIndex];
+			const frameRate = video?.frameRate || 30;
+			const bitrate = this.videoQuality?.averageBitrate || 4000000;
+
 			const options = this.hwDetector.applyHardwareConfig(
 				hwConfigToUse,
 				width,
 				height,
 				codec,
+				frameRate,
+				bitrate,
+				false, // Not a live stream for now
 			);
 
 			this.cachedHwOptions.set(key, options);
@@ -879,111 +917,155 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
      * Generate FFMPEG transcoding arguments for processing segments
      */
 	private getTranscodeArgs (builder: ArgsBuilder, segments: Segment[]): Either<FFMPEGOptions> {
-		if (segments.length === 0) {
-			return Either.error(
-				createNotFoundError(
-					`No segments to process for stream ${this.type} ${this.streamIndex} ${this.quality}`,
-				),
+		return Either.of(segments)
+			.filter(
+				segs => segs.length > 0,
+				() => createNotFoundError(`No segments to process for stream ${this.type} ${this.streamIndex} ${this.quality}`),
+			)
+			.map(segs => this.calculateSegmentTimings(segs))
+			.map(timing => ({
+				...timing,
+				timestamps: this.extractTimestamps(segments, timing.startKeyframeIndex),
+			}))
+			.map(data => ({
+				...data,
+				segmentTimestamps: this.formatTimestamps(data.timestamps),
+				relativeTimestamps: this.formatRelativeTimestamps(data.timestamps, data.keyframeStartTime),
+			}))
+			.map(data => ({
+				...data,
+				baseOptions: this.createBaseFFMPEGOptions(data.startTime, data.endTime),
+			}))
+			.chain(data => 
+				builder(data.segmentTimestamps)
+					.map(transcodeArgs => this.mergeFFMPEGOptions(
+						data.baseOptions,
+						transcodeArgs,
+						data.relativeTimestamps,
+						data.startKeyframeIndex,
+					)),
 			);
-		}
+	}
 
+	// Helper functions
+	private calculateSegmentTimings = (segments: Segment[]) => {
 		const startSegment = segments[0];
 		const lastSegment = segments[segments.length - 1];
-
-		let startTime = 0;
-		let startKeyframeIndex = startSegment.index;
-		let keyframeStartTime = 0;
-
-		if (startSegment.index !== 0) {
-			startKeyframeIndex = startSegment.index - 1;
-			const prevSegment = this.segments.get(startKeyframeIndex);
-
-			if (prevSegment) {
-				keyframeStartTime = prevSegment.start;
-
-				if (this.type === StreamType.AUDIO) {
-					startTime = prevSegment.start;
-				} else if (startSegment.index === this.segments.size - 1) {
-					startTime = (prevSegment.start + this.metadata.duration) / 2;
-				} else {
-					startTime = (prevSegment.start + startSegment.start) / 2;
-				}
-			}
-		}
-
-		const nextSegmentIndex = lastSegment.index + 1;
-		const nextSegment = this.segments.get(nextSegmentIndex);
+		
+		const isFirstSegment = startSegment.index === 0;
+		const startKeyframeIndex = isFirstSegment ? 0 : startSegment.index - 1;
+		
+		const timings = isFirstSegment ? 
+			{ startTime: 0, keyframeStartTime: 0 } :
+			this.calculateNonFirstSegmentTimings(startSegment, startKeyframeIndex);
+		
+		const nextSegment = this.segments.get(lastSegment.index + 1);
 		const endTime = nextSegment ? nextSegment.start : null;
+		
+		return {
+			...timings,
+			startKeyframeIndex,
+			endTime,
+		};
+	};
 
-		let timestamps = segments
-			.filter((segment) => segment.index > startKeyframeIndex)
-			.map((segment) => segment.start);
-
-		if (timestamps.length === 0) {
-			timestamps = [9999999];
+	private calculateNonFirstSegmentTimings = (startSegment: Segment, startKeyframeIndex: number) => {
+		const prevSegment = this.segments.get(startKeyframeIndex);
+		
+		if (!prevSegment) {
+			return { startTime: 0, keyframeStartTime: 0 };
 		}
+		
+		const keyframeStartTime = prevSegment.start;
+		const startTime = this.calculateStartTime(prevSegment, startSegment);
+		
+		return { startTime, keyframeStartTime };
+	};
 
-		const segmentTimestamps = timestamps
-			.map((time) => time.toFixed(6))
-			.join(',');
+	private calculateStartTime = (prevSegment: Segment, startSegment: Segment): number => {
+		if (this.type === StreamType.AUDIO) {
+			return prevSegment.start;
+		}
+		
+		if (startSegment.index === this.segments.size - 1) {
+			return (prevSegment.start + this.metadata.duration) / 2;
+		}
+		
+		return (prevSegment.start + startSegment.start) / 2;
+	};
 
-		const relativeTimestamps = timestamps
-			.map((time) => (time - keyframeStartTime).toFixed(6))
-			.join(',');
+	private extractTimestamps = (segments: Segment[], startKeyframeIndex: number): number[] => {
+		const timestamps = segments
+			.filter(segment => segment.index > startKeyframeIndex)
+			.map(segment => segment.start);
+		
+		return timestamps.length === 0 ? [9999999] : timestamps;
+	};
 
-		const options: FFMPEGOptions = {
-			inputOptions: ['-nostats', '-hide_banner', '-loglevel', 'warning'],
+	private formatTimestamps = (timestamps: number[]): string =>
+		timestamps.map(time => time.toFixed(6)).join(',');
+
+	private formatRelativeTimestamps = (timestamps: number[], keyframeStartTime: number): string =>
+		timestamps.map(time => (time - keyframeStartTime).toFixed(6)).join(',');
+
+	private createBaseFFMPEGOptions = (startTime: number, endTime: number | null): FFMPEGOptions => {
+		const inputOptions = ['-nostats', '-hide_banner', '-loglevel', 'warning'];
+		
+		if (startTime > 0) {
+			if (this.type === StreamType.VIDEO) {
+				inputOptions.push('-noaccurate_seek');
+			}
+			inputOptions.push('-ss', startTime.toFixed(6));
+		}
+		
+		if (endTime !== null) {
+			const adjustedEndTime = endTime + startTime;
+			inputOptions.push('-to', adjustedEndTime.toFixed(6));
+		}
+		
+		inputOptions.push('-fflags', '+genpts');
+		
+		return {
+			inputOptions,
 			outputOptions: [],
 			videoFilters: undefined,
 		};
+	};
 
-		if (startTime > 0) {
-			if (this.type === StreamType.VIDEO) {
-				options.inputOptions.push('-noaccurate_seek');
-			}
-
-			options.inputOptions.push('-ss', startTime.toFixed(6));
-		}
-
-		if (endTime !== null) {
-			const adjustedEndTime = endTime + (startTime - keyframeStartTime);
-
-			options.inputOptions.push('-to', adjustedEndTime.toFixed(6));
-		}
-
-		options.inputOptions.push('-fflags', '+genpts');
-
-		return builder(segmentTimestamps)
-			.map((transcodeArgs) => ({
-				inputOptions: [
-					...options.inputOptions,
-					...transcodeArgs.inputOptions,
-				],
-				outputOptions: [
-					...options.outputOptions,
-					...transcodeArgs.outputOptions,
-					'-start_at_zero',
-					'-copyts',
-					'-muxdelay',
-					'0',
-					'-f',
-					'segment',
-					'-segment_time_delta',
-					'0.05',
-					'-segment_format',
-					'mpegts',
-					'-segment_times',
-					relativeTimestamps,
-					'-segment_list_type',
-					'flat',
-					'-segment_list',
-					'pipe:1',
-					'-segment_start_number',
-					startKeyframeIndex.toString(),
-				],
-				videoFilters: transcodeArgs.videoFilters,
-			}));
-	}
+	private mergeFFMPEGOptions = (
+		baseOptions: FFMPEGOptions,
+		transcodeArgs: FFMPEGOptions,
+		relativeTimestamps: string,
+		startKeyframeIndex: number,
+	): FFMPEGOptions => ({
+		inputOptions: [
+			...baseOptions.inputOptions,
+			...transcodeArgs.inputOptions,
+		],
+		outputOptions: [
+			...baseOptions.outputOptions,
+			...transcodeArgs.outputOptions,
+			'-start_at_zero',
+			'-copyts',
+			'-muxdelay',
+			'0',
+			'-f',
+			'segment',
+			'-segment_time_delta',
+			'0.05',
+			'-segment_format',
+			'mpegts',
+			'-segment_times',
+			relativeTimestamps,
+			'-segment_list_type',
+			'flat',
+			'-segment_list',
+			'pipe:1',
+			'-segment_start_number',
+			startKeyframeIndex.toString(),
+		],
+		videoFilters: transcodeArgs.videoFilters,
+	});
 
 	/**
      * Build the FFMPEG command for transcoding
@@ -1022,8 +1104,37 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 		outputDir: string,
 		priority: number,
 	): TaskEither<void> {
+		// Use pipeline processor for better performance
 		return TaskEither.tryCatch(
-			() => this.setupAndRunCommand(initialSegment, segments, options, outputDir, priority),
+			async () => {
+				// Process segment with pipeline
+				await this.pipelineProcessor.processSegment(
+					initialSegment.index,
+					async (_data) => {
+						await this.setupAndRunCommand(initialSegment, segments, options, outputDir, priority);
+
+						return {
+							success: true,
+							segmentIndex: initialSegment.index,
+							outputPath: path.join(outputDir, `segment-${initialSegment.index}.ts`),
+							duration: initialSegment.duration,
+						};
+					},
+					{
+						fileId: this.source.getFilePath(),
+						sourceFilePath: this.source.getFilePath(),
+						streamType: this.type,
+						quality: this.quality,
+						streamIndex: this.streamIndex,
+						segmentIndex: initialSegment.index,
+						segmentStart: initialSegment.start,
+						segmentDuration: initialSegment.duration,
+						totalSegments: this.segments.size,
+						ffmpegOptions: options,
+						outputPath: path.join(outputDir, `segment-${initialSegment.index}.ts`),
+					},
+				);
+			},
 			'Failed to execute transcode command',
 		);
 	}

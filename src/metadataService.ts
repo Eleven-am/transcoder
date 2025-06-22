@@ -123,56 +123,96 @@ export class MetadataService {
 			.orElse(() => TaskEither.of(hwConfig));
 	}
 
+	// Pure helper functions for master playlist generation
+	private generateAudioRenditionsList = (audios: AudioInfo[]): string[] => 
+		audios.map((x) => this.generateAudioRenditionEntries(x));
+
+	private extractVideoRenditionData = (videos: VideoInfo[]) => 
+		videos.map((x) => this.generateVideoRenditionEntries(x));
+
+	private extractMediaTypes = (videoRenditions: Array<{ mediaTypes: string; mappedProfile: string }>): string[] => 
+		videoRenditions.map(({ mediaTypes }) => mediaTypes);
+
+	private extractMappedProfiles = (videoRenditions: Array<{ mediaTypes: string; mappedProfile: string }>): string[] => 
+		videoRenditions.map(({ mappedProfile }) => mappedProfile);
+
+	private buildMasterPlaylistArray = (
+		audioRenditions: string[],
+		videoMediaTypes: string[],
+		videoMappedProfiles: string[],
+	): string[] => [
+		'#EXTM3U',
+		...audioRenditions,
+		'',
+		...videoMediaTypes,
+		'',
+		...videoMappedProfiles,
+	];
+
+	private joinPlaylistLines = (lines: string[]): string => 
+		lines.join('\n');
+
+	private findDefaultStream = <T extends { isDefault: boolean }>(streams: T[]): T | undefined => 
+		streams.find((stream) => stream.isDefault);
+
+	private getAudioQualityForStream = (audio: AudioInfo): AudioQualityEnum => 
+		this.isAudioHLSCompatible(audio) ? AudioQualityEnum.ORIGINAL : AudioQualityEnum.AAC;
+
+	private getVideoQualityForStream = (video: VideoInfo): VideoQualityEnum => 
+		this.isVideoHLSCompatible(video) ? VideoQualityEnum.ORIGINAL : VideoQualityEnum.P240;
+
+	private buildAudioQuality = (defaultAudio: AudioInfo | undefined) => 
+		defaultAudio
+			? {
+				index: defaultAudio.index,
+				quality: this.getAudioQualityForStream(defaultAudio),
+			}
+			: {
+				index: 0,
+				quality: AudioQualityEnum.AAC,
+			};
+
+	private buildVideoQuality = (defaultVideo: VideoInfo | undefined) => 
+		defaultVideo
+			? {
+				index: defaultVideo.index,
+				quality: this.getVideoQualityForStream(defaultVideo),
+			}
+			: {
+				index: 0,
+				quality: VideoQualityEnum.P240,
+			};
+
+	private buildMasterPlaylist = (metadata: MediaMetadata): MasterPlaylist => {
+		const audioRenditions = this.generateAudioRenditionsList(metadata.audios);
+		const videoRenditions = this.extractVideoRenditionData(metadata.videos);
+		const videoMediaTypes = this.extractMediaTypes(videoRenditions);
+		const videoMappedProfiles = this.extractMappedProfiles(videoRenditions);
+		
+		const playlistArray = this.buildMasterPlaylistArray(
+			audioRenditions,
+			videoMediaTypes,
+			videoMappedProfiles,
+		);
+		
+		const masterString = this.joinPlaylistLines(playlistArray);
+		const defaultAudio = this.findDefaultStream(metadata.audios);
+		const defaultVideo = this.findDefaultStream(metadata.videos);
+		
+		return {
+			master: masterString,
+			video: this.buildVideoQuality(defaultVideo),
+			audio: this.buildAudioQuality(defaultAudio),
+		};
+	};
+
 	/**
      * Get the master playlist for the media file
      * @returns The master playlist as a string
      */
 	getMasterPlaylist (source: MediaSource): TaskEither<MasterPlaylist> {
-		const genPlaylist = (metadata: MediaMetadata): MasterPlaylist => {
-			const videoRenditions = metadata.videos.map((x) => this.generateVideoRenditionEntries(x));
-
-			const master = [
-				'#EXTM3U',
-				...metadata.audios.map((x) => this.generateAudioRenditionEntries(x)),
-				'',
-				...videoRenditions.map(({ mediaTypes }) => mediaTypes),
-				'',
-				...videoRenditions.map(({ mappedProfile }) => mappedProfile),
-			];
-
-			const defaultAudio = metadata.audios.find((audio) => audio.isDefault);
-			const defaultVideo = metadata.videos.find((video) => video.isDefault);
-
-			const audioQuality = defaultAudio
-				? {
-					index: defaultAudio.index,
-					quality: this.isAudioHLSCompatible(defaultAudio) ? AudioQualityEnum.ORIGINAL : AudioQualityEnum.AAC,
-				}
-				: {
-					index: 0,
-					quality: AudioQualityEnum.AAC,
-				};
-
-			const videoQuality = defaultVideo
-				? {
-					index: defaultVideo.index,
-					quality: this.isVideoHLSCompatible(defaultVideo) ? VideoQualityEnum.ORIGINAL : VideoQualityEnum.P240,
-				}
-				: {
-					index: 0,
-					quality: VideoQualityEnum.P240,
-				};
-
-			const string = master.join('\n');
-
-			return {
-				master: string,
-				video: videoQuality,
-				audio: audioQuality,
-			};
-		};
-
-		return this.getMetadata(source).map((metadata) => genPlaylist(metadata));
+		return this.getMetadata(source)
+			.map(this.buildMasterPlaylist);
 	}
 
 	/**
@@ -280,7 +320,6 @@ export class MetadataService {
      */
 	private extractMediaInfo (fileId: string, source: MediaSource): TaskEither<MediaMetadata> {
 		const filePath = source.getFilePath();
-
 		const args = [
 			'-print_format',
 			'json',
@@ -295,68 +334,95 @@ export class MetadataService {
 				ffprobe: this.probe(args),
 				keyframes: this.extractKeyframes(source, 0),
 			})
-			.map(({ ffprobe, keyframes }) => {
-				const ffprobeData = JSON.parse(ffprobe);
-				const mediaInfo: MediaMetadata = {
-					keyframes,
-					id: fileId,
-					path: filePath,
-					extension: path.extname(filePath).substring(1),
-					mimeCodec: null,
-					duration: parseFloat(ffprobeData.format.duration || '0'),
-					container: ffprobeData.format.format_name || null,
-					videos: [],
-					audios: [],
-					subtitles: [],
-					fonts: [],
-					chapters: [],
-					extractionTimestamp: new Date(),
-				};
-
-				let videoIndex = 0;
-				let audioIndex = 0;
-				let subtitleIndex = 0;
-
-				for (const stream of ffprobeData.streams || []) {
-					if (stream.codec_type === 'video' && !stream.disposition?.attached_pic) {
-						const videoStream = this.processVideoStream(stream, videoIndex++);
-
-						mediaInfo.videos.push(videoStream);
-					} else if (stream.codec_type === 'audio') {
-						const audioStream = this.processAudioStream(stream, audioIndex++);
-
-						mediaInfo.audios.push(audioStream);
-					} else if (stream.codec_type === 'subtitle') {
-						const subtitleStream = this.processSubtitleStream(stream, subtitleIndex++);
-
-						mediaInfo.subtitles.push(subtitleStream);
-					} else if (stream.codec_type === 'attachment') {
-						if (stream.tags?.filename &&
-                            (stream.tags.filename.endsWith('.ttf') ||
-                                stream.tags.filename.endsWith('.otf'))) {
-							mediaInfo.fonts.push(stream.tags.filename);
-						}
-					}
-				}
-
-				if (ffprobeData.chapters) {
-					for (const chapter of ffprobeData.chapters) {
-						if (chapter.tags) {
-							mediaInfo.chapters.push({
-								startTime: parseFloat(chapter.start_time),
-								endTime: parseFloat(chapter.end_time),
-								name: chapter.tags.title || `Chapter ${chapter.id}`,
-								type: 'content',
-							});
-						}
-					}
-				}
-
-				this.generateMimeCodec(mediaInfo);
-
-				return mediaInfo;
-			});
+			.map(({ ffprobe, keyframes }) => ({
+				ffprobeData: JSON.parse(ffprobe),
+				keyframes,
+				fileId,
+				filePath,
+			}))
+			.map(data => ({
+				...data,
+				baseMetadata: this.createBaseMetadata(data.fileId, data.filePath, data.keyframes, data.ffprobeData),
+			}))
+			.map(data => ({
+				...data,
+				processedStreams: this.processStreams(data.ffprobeData.streams || []),
+			}))
+			.map(data => ({
+				...data.baseMetadata,
+				...data.processedStreams,
+				chapters: this.processChapters(data.ffprobeData.chapters || []),
+			}))
+			.ioSync(metadata => this.generateMimeCodec(metadata));
 	}
+
+	// Pure helper functions
+	private createBaseMetadata = (fileId: string, filePath: string, keyframes: number[], ffprobeData: any): MediaMetadata => ({
+		keyframes,
+		id: fileId,
+		path: filePath,
+		extension: path.extname(filePath).substring(1),
+		mimeCodec: null,
+		duration: parseFloat(ffprobeData.format?.duration || '0'),
+		container: ffprobeData.format?.format_name || null,
+		videos: [],
+		audios: [],
+		subtitles: [],
+		fonts: [],
+		chapters: [],
+		extractionTimestamp: new Date(),
+	});
+
+	private processStreams = (streams: any[]) => {
+		const processedStreams = {
+			videos: [] as VideoInfo[],
+			audios: [] as AudioInfo[],
+			subtitles: [] as SubtitleInfo[],
+			fonts: [] as string[],
+		};
+
+		let videoIndex = 0;
+		let audioIndex = 0;
+		let subtitleIndex = 0;
+
+		streams.forEach(stream => {
+			if (this.isVideoStream(stream)) {
+				processedStreams.videos.push(this.processVideoStream(stream, videoIndex++));
+			} else if (this.isAudioStream(stream)) {
+				processedStreams.audios.push(this.processAudioStream(stream, audioIndex++));
+			} else if (this.isSubtitleStream(stream)) {
+				processedStreams.subtitles.push(this.processSubtitleStream(stream, subtitleIndex++));
+			} else if (this.isFontAttachment(stream)) {
+				processedStreams.fonts.push(stream.tags.filename);
+			}
+		});
+
+		return processedStreams;
+	};
+
+	private isVideoStream = (stream: any): boolean =>
+		stream.codec_type === 'video' && !stream.disposition?.attached_pic;
+
+	private isAudioStream = (stream: any): boolean =>
+		stream.codec_type === 'audio';
+
+	private isSubtitleStream = (stream: any): boolean =>
+		stream.codec_type === 'subtitle';
+
+	private isFontAttachment = (stream: any): boolean =>
+		stream.codec_type === 'attachment' &&
+		stream.tags?.filename &&
+		(stream.tags.filename.endsWith('.ttf') || stream.tags.filename.endsWith('.otf'));
+
+	private processChapters = (chapters: any[]) =>
+		chapters
+			.filter(chapter => chapter.tags)
+			.map(chapter => ({
+				startTime: parseFloat(chapter.start_time),
+				endTime: parseFloat(chapter.end_time),
+				name: chapter.tags.title || `Chapter ${chapter.id}`,
+				type: 'content' as const,
+			}));
 
 	/**
      * Run ffprobe with the given arguments
@@ -407,8 +473,22 @@ export class MetadataService {
 			width: parseInt(stream.width, 10) || 0,
 			height: parseInt(stream.height, 10) || 0,
 			bitrate: parseInt(stream.bit_rate ?? 1800000, 10) || 0,
+			frameRate: this.parseFrameRate(stream.r_frame_rate || stream.avg_frame_rate || '30/1'),
 			isDefault: Boolean(stream.disposition?.default),
 		};
+	}
+
+	/**
+	 * Parse frame rate string (e.g., "30/1" or "29.97")
+	 */
+	private parseFrameRate (frameRateStr: string): number {
+		if (frameRateStr.includes('/')) {
+			const [num, den] = frameRateStr.split('/').map(Number);
+
+			return den > 0 ? num / den : 30;
+		}
+
+		return parseFloat(frameRateStr) || 30;
 	}
 
 	/**

@@ -21,3 +21,4 @@ export * from './localSegmentProcessor';
 export * from './distributedSegmentProcessor';
 export * from './redisSegmentClaimManager';
 export * from './segmentProcessorFactory';
+export * from './workStealingProcessor';

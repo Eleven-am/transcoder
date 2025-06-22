@@ -81,6 +81,7 @@ export interface VideoInfo {
     width: number;
     height: number;
     bitrate: number;
+    frameRate: number;
     isDefault: boolean;
 }
 

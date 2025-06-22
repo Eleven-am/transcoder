@@ -21,6 +21,7 @@ import { createClient, RedisClientType } from 'redis';
 import { DistributedSegmentProcessor } from './distributedSegmentProcessor';
 import { DistributedConfig, ISegmentProcessor } from './interfaces';
 import { LocalSegmentProcessor } from './localSegmentProcessor';
+import { WorkStealingProcessor } from './workStealingProcessor';
 
 /**
  * Factory for creating segment processors
@@ -84,8 +85,19 @@ export class SegmentProcessorFactory {
 						// Test Redis connection
 						await this.redisClient.ping();
 
-						console.log('Redis connection successful, using distributed mode');
-						this.instance = new DistributedSegmentProcessor(this.redisClient, config);
+						// Check if work stealing is enabled
+						if (config?.enableWorkStealing) {
+							console.log('Redis connection successful, using distributed mode with work stealing');
+							this.instance = new WorkStealingProcessor(this.redisClient, {
+								workerId: config.workerId,
+								stealThreshold: config.stealThreshold,
+								stealCheckInterval: config.stealCheckInterval,
+								maxStealsPerCheck: config.maxStealsPerCheck,
+							});
+						} else {
+							console.log('Redis connection successful, using distributed mode');
+							this.instance = new DistributedSegmentProcessor(this.redisClient, config);
+						}
 					} catch (error) {
 						console.error('Failed to connect to Redis:', error);
 
@@ -106,7 +118,7 @@ export class SegmentProcessorFactory {
 					this.instance = new LocalSegmentProcessor(config?.workerId);
 				}
 
-				return this.instance;
+				return this.instance!;
 			} finally {
 				// Clear the initialization promise after completion
 				this.initializationPromise = null;
@@ -145,7 +157,7 @@ export class SegmentProcessorFactory {
 	/**
      * Get current processor mode
      */
-	static async getMode (): Promise<'local' | 'distributed' | 'not-initialized'> {
+	static async getMode (): Promise<string> {
 		if (!this.instance) {
 			return 'not-initialized';
 		}

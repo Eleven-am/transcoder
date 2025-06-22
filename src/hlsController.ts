@@ -18,6 +18,7 @@
 
 import { createBadRequestError, TaskEither } from '@eleven-am/fp';
 
+import { AdaptiveQualitySelector } from './adaptiveQualitySelector';
 import { ClientTracker } from './clientTracker';
 import { ISegmentProcessor, SegmentProcessorFactory } from './distributed';
 import { FileDatabase } from './fileDatabase';
@@ -58,6 +59,8 @@ export class HLSController {
 
 	readonly #qualityService: QualityService;
 
+	readonly #adaptiveQualitySelector: AdaptiveQualitySelector;
+
 	readonly #streams: Map<string, Stream>;
 
 	readonly #clientTracker: ClientTracker;
@@ -87,6 +90,7 @@ export class HLSController {
 		const database = options.database || new FileDatabase(this.#fileStorage);
 
 		this.#qualityService = new QualityService(options.videoQualities, options.audioQualities);
+		this.#adaptiveQualitySelector = new AdaptiveQualitySelector();
 		this.#metadataService = new MetadataService(
 			this.#qualityService,
 			database,
@@ -335,6 +339,28 @@ export class HLSController {
 	}
 
 	/**
+	 * Get adaptive quality recommendations based on source video
+	 * @param filePath The file path of the media source
+	 */
+	async getAdaptiveQualities (filePath: string): Promise<{
+		qualities: VideoQualityEnum[];
+		reason: string;
+		complexityScore: number;
+	}> {
+		const source = this.#buildMediaSource(filePath);
+
+		const result = await this.#metadataService.getMetadata(source)
+			.chain((metadata) => this.#adaptiveQualitySelector.selectOptimalQualities(metadata))
+			.toPromise();
+
+		return {
+			qualities: result.selectedQualities.map((q) => q.value),
+			reason: result.reason,
+			complexityScore: result.complexityScore,
+		};
+	}
+
+	/**
      * Dispose of the controller and clean up resources
      */
 	async dispose (): Promise<void> {
@@ -448,17 +474,20 @@ export class HLSController {
 				this.#streams.set(stream.getStreamId(), stream);
 			});
 
+		// Pure helper functions
+		const buildStreamId = (fileId: string) => Stream.getStreamId(fileId, type, quality, streamIndex);
+		
+		const getExistingStream = (streamId: string) => this.#streams.get(streamId);
+
 		return source.getFileId()
-			.chain((fileId) => {
-				const streamId = Stream.getStreamId(fileId, type, quality, streamIndex);
-				const localStream = this.#streams.get(streamId);
-
-				if (localStream) {
-					return TaskEither.of(localStream);
-				}
-
-				return createStream();
-			});
+			.map(buildStreamId)
+			.map(streamId => ({
+				streamId,
+				existingStream: getExistingStream(streamId),
+			}))
+			.chain(({ existingStream }) => 
+				existingStream ? TaskEither.of(existingStream) : createStream(),
+			);
 	}
 
 
