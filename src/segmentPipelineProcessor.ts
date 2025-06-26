@@ -123,7 +123,21 @@ export class SegmentPipelineProcessor extends EventEmitter {
 				({ failures }) => createInternalError(`Failed to process ${failures.length} segments`),
 			)
 			.map(({ successes }) => {
-				const results: SegmentProcessingResult[] = [];
+				// Create array with proper length to avoid sparse arrays
+				const maxIndex = Math.max(...successes.map(s => s.index));
+				const results: SegmentProcessingResult[] = new Array(maxIndex + 1);
+				
+				// Fill with error results for missing indices
+				for (let i = 0; i <= maxIndex; i++) {
+					results[i] = {
+						success: false,
+						segmentIndex: i,
+						outputPath: '',
+						error: new Error('Segment not processed'),
+					};
+				}
+				
+				// Override with actual results
 				successes.forEach(({ index, result }) => {
 					results[index] = result;
 				});

@@ -91,14 +91,19 @@ export class LocalSegmentProcessor implements ISegmentProcessor {
 
 		await fs.promises.mkdir(outputDir, { recursive: true });
 
-		// Create temp file path with worker ID to avoid collisions
-		const tempPath = `${data.outputPath}.${this.workerId}.tmp`;
+		// Create temp directory with worker ID and segment index to avoid collisions
+		const tempDir = `${outputDir}.${this.workerId}.seg${data.segmentIndex}.${Date.now()}.tmp`;
+		await fs.promises.mkdir(tempDir, { recursive: true });
+
+		// Use pattern for segment muxer
+		const outputPattern = path.join(tempDir, 'segment-%d.ts');
+		const expectedTempPath = path.join(tempDir, `segment-${data.segmentIndex}.ts`);
 
 		return new Promise((resolve, reject) => {
 			const command = ffmpeg(data.sourceFilePath)
 				.inputOptions(inputOptions)
 				.outputOptions(outputOptions)
-				.output(tempPath);
+				.output(outputPattern);
 
 			if (videoFilters) {
 				command.videoFilters(videoFilters);
@@ -106,15 +111,17 @@ export class LocalSegmentProcessor implements ISegmentProcessor {
 
 			command.on('end', async () => {
 				try {
-					// Atomic rename from temp to final path
-					await fs.promises.rename(tempPath, data.outputPath);
+					// Move the generated segment to final location
+					await fs.promises.rename(expectedTempPath, data.outputPath);
+					// Clean up temp directory
+					await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
 					resolve();
 				} catch (renameError: any) {
 					// If rename fails due to file already existing, that's ok
 					if (renameError.code === 'EEXIST') {
 						console.log(`Segment ${data.segmentIndex} already exists (lost race to another worker)`);
-						// Clean up our temp file
-						await fs.promises.unlink(tempPath).catch(() => {});
+						// Clean up temp directory
+						await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
 						resolve();
 					} else {
 						reject(renameError);
@@ -122,11 +129,11 @@ export class LocalSegmentProcessor implements ISegmentProcessor {
 				}
 			});
 			command.on('error', async (err) => {
-				// Attempt to clean up temp file on error
+				// Attempt to clean up temp directory on error
 				try {
-					await fs.promises.unlink(tempPath);
+					await fs.promises.rm(tempDir, { recursive: true, force: true });
 				} catch {
-					// Ignore unlink errors - file may not exist
+					// Ignore errors - directory may not exist
 				}
 				reject(err);
 			});

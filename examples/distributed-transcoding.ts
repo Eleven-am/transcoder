@@ -1,8 +1,8 @@
-import { HLSController } from '../src';
+import {HLSController, StreamType} from '../src';
 
 /**
  * Example: Using @eleven-am/transcoder in distributed mode
- * 
+ *
  * This example shows how to configure the transcoder to work
  * across multiple Kubernetes pods or Docker containers
  */
@@ -13,7 +13,7 @@ async function main() {
         cacheDirectory: '/var/data/hls',
         hwAccel: true,
     });
-    
+
     await localController.initialize();
     console.log('Local mode initialized');
 
@@ -29,7 +29,7 @@ async function main() {
             fallbackToLocal: true, // Fall back if Redis fails
         },
     });
-    
+
     await distributedController.initialize();
     console.log('Distributed mode initialized');
 
@@ -45,18 +45,18 @@ async function main() {
             workerId: process.env.HOSTNAME,
         },
     });
-    
+
     await autoController.initialize();
-    
+
     // The API remains exactly the same regardless of mode
-    const playlist = await autoController.getPlaylist(
+    const playlist = await autoController.getIndexPlaylist(
         '/media/video.mp4',
         'client-123',
-        'v',
+        StreamType.VIDEO,
         '1080p',
         0
     );
-    
+
     console.log('Playlist generated:', playlist);
 
     // Cleanup

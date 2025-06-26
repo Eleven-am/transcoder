@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
 
@@ -36,7 +37,7 @@ import { RedisSegmentClaimManager } from './redisSegmentClaimManager';
  * Distributed segment processor - coordinate segment processing across multiple nodes
  * Falls back to local processing if Redis is unavailable
  */
-export class DistributedSegmentProcessor implements ISegmentProcessor {
+export class DistributedSegmentProcessor extends EventEmitter implements ISegmentProcessor {
 	private readonly claimManager: RedisSegmentClaimManager;
 
 	private readonly localProcessor: LocalSegmentProcessor;
@@ -61,6 +62,7 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
         private readonly redis: RedisClientType,
         config: DistributedConfig = {},
 	) {
+		super();
 		this.workerId = config.workerId || process.env.HOSTNAME || os.hostname();
 		this.claimRenewalInterval = config.claimRenewalInterval || 20000;
 		this.segmentTimeout = config.segmentTimeout || 30000;
@@ -238,6 +240,9 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 					console.error(`Error extending claim for segment ${segmentIndex}:`, error);
 				}
 			}, this.claimRenewalInterval);
+			
+			// Add creation timestamp for age-based eviction
+			(timer as any).createdAt = Date.now();
 
 			// Implement LRU eviction if at capacity
 			if (this.activeRenewals.size >= this.MAX_ACTIVE_RENEWALS) {
@@ -307,6 +312,13 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 					await claim.release();
 				} catch (err) {
 					console.error('CRITICAL: Failed to release claim during cleanup:', {
+						segmentKey: claim.segmentKey,
+						workerId: this.workerId,
+						error: err,
+					});
+					// Emit critical error for monitoring
+					this.emit('critical:error', {
+						type: 'claim_release_failed',
 						segmentKey: claim.segmentKey,
 						workerId: this.workerId,
 						error: err,
@@ -548,6 +560,19 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 
 	// Memory management helper methods
 	private evictOldestRenewal = (): void => {
+		// Evict renewals that have been active for too long (likely stuck)
+		const now = Date.now();
+		const maxAge = this.segmentTimeout * 2; // 2x segment timeout
+		
+		for (const [key, timer] of this.activeRenewals.entries()) {
+			// Store creation time in the timer object
+			if ((timer as any).createdAt && now - (timer as any).createdAt > maxAge) {
+				this.cleanupRenewal(key);
+				return;
+			}
+		}
+		
+		// Fallback to FIFO if no old renewals found
 		const firstKey = this.activeRenewals.keys().next().value;
 		if (firstKey) {
 			this.cleanupRenewal(firstKey);
