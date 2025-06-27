@@ -62,7 +62,7 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 		this.claimRenewalInterval = config.claimRenewalInterval || 20000;
 		this.segmentTimeout = config.segmentTimeout || 30000;
 		this.fallbackToLocal = config.fallbackToLocal !== false;
-		this.fileWaitTimeout = config.fileWaitTimeout || 10000; // Default 10 seconds
+		this.fileWaitTimeout = config.fileWaitTimeout || 10000;
 
 		this.claimManager = new RedisSegmentClaimManager(
 			redis,
@@ -79,7 +79,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 		let renewalTimer: NodeJS.Timeout | null = null;
 
 		try {
-			// Check if segment is already completed
 			if (await this.segmentExists(data.outputPath)) {
 				return {
 					success: true,
@@ -89,7 +88,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 				};
 			}
 
-			// Check Redis for completion status
 			const isCompleted = await this.claimManager.isSegmentCompleted(
 				data.fileId,
 				data.streamType,
@@ -99,7 +97,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 			);
 
 			if (isCompleted) {
-				// Wait for file to appear on disk (may be processing on another node)
 				const fileAppeared = await this.waitForFile(data.outputPath, this.fileWaitTimeout);
 
 				return {
@@ -111,7 +108,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 				};
 			}
 
-			// Try to claim the segment
 			claim = await this.claimManager.claimSegment(
 				data.fileId,
 				data.streamType,
@@ -121,11 +117,9 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 			);
 
 			if (!claim.acquired) {
-				// Another worker has the claim, wait for completion
 				return await this.waitForSegmentCompletion(data);
 			}
 
-			// We have the claim, set up automatic renewal
 			renewalTimer = setInterval(async () => {
 				try {
 					const extended = await claim!.extend();
@@ -140,11 +134,9 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 
 			this.activeRenewals.set(claim.segmentKey, renewalTimer);
 
-			// Process the segment locally
 			const result = await this.localProcessor.processSegment(data);
 
 			if (result.success) {
-				// Mark as completed in Redis
 				await this.claimManager.markSegmentCompleted(
 					data.fileId,
 					data.streamType,
@@ -153,7 +145,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 					data.segmentIndex,
 				);
 
-				// Notify waiting workers
 				await this.claimManager.publishSegmentComplete(
 					data.fileId,
 					data.streamType,
@@ -165,7 +156,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 
 			return result;
 		} catch (error) {
-			// Handle Redis connection errors by falling back to local
 			if (this.fallbackToLocal && this.isRedisError(error)) {
 				console.warn('Redis error, falling back to local processing:', error);
 
@@ -189,14 +179,13 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 
 			if (claim?.acquired) {
 				try {
-					await claim.release();
+					await claim?.release();
 				} catch (err) {
 					console.error('CRITICAL: Failed to release claim during cleanup:', {
-						segmentKey: claim.segmentKey,
+						segmentKey: claim?.segmentKey,
 						workerId: this.workerId,
 						error: err,
 					});
-					// Do not re-throw - the claim will expire via TTL
 				}
 			}
 		}
@@ -212,7 +201,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 
 			return true;
 		} catch {
-			// If Redis is down but fallback is enabled, we're still "healthy"
 			return this.fallbackToLocal;
 		}
 	}
@@ -224,16 +212,13 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 	async dispose (): Promise<void> {
 		this.disposed = true;
 
-		// Clear all renewal timers
 		for (const timer of this.activeRenewals.values()) {
 			clearInterval(timer);
 		}
 		this.activeRenewals.clear();
 
-		// Dispose claim manager to clean up Redis connections
 		await this.claimManager.dispose();
 
-		// Dispose local processor
 		await this.localProcessor.dispose();
 	}
 
@@ -257,7 +242,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 		};
 
 		try {
-			// Subscribe to completion events
 			unsubscribe = await this.claimManager.subscribeToSegmentComplete(
 				data.fileId,
 				data.streamType,
@@ -269,7 +253,6 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 				},
 			);
 
-			// Set up periodic file check
 			const checkPromise = new Promise<boolean>((resolve) => {
 				const checkFile = async () => {
 					if (segmentCompleted || await this.segmentExists(data.outputPath)) {
@@ -278,14 +261,11 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 					}
 				};
 
-				// Check immediately
 				checkFile();
 
-				// Then check periodically
 				checkInterval = setInterval(checkFile, 1000);
 			});
 
-			// Wait for either completion or timeout
 			const timeoutPromise = new Promise<boolean>((resolve) => {
 				setTimeout(() => resolve(false), this.segmentTimeout);
 			});
@@ -348,14 +328,12 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 	}
 
 	private isRedisError (error: unknown): boolean {
-		// Type guard for Node.js system errors
 		const nodeError = error as NodeJS.ErrnoException;
 
 		if (nodeError?.code === 'ECONNREFUSED' || nodeError?.code === 'ETIMEDOUT') {
 			return true;
 		}
 
-		// Check error message for Redis-related errors
 		if (error instanceof Error) {
 			const message = error.message.toLowerCase();
 
