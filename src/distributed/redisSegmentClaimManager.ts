@@ -33,13 +33,18 @@ export class RedisSegmentClaimManager {
 
 	private readonly completedSegmentTTL: number;
 
+	private readonly subscriberPool: RedisClientType[] = [];
+
+	private readonly poolSize = 5;
+
+	private disposed = false;
+
 	constructor (
         private readonly redis: RedisClientType,
         private readonly workerId: string,
         private readonly defaultTTL: number = 60000, // 60 seconds
         completedSegmentTTL?: number,
 	) {
-		// Default to 7 days if not specified
 		this.completedSegmentTTL = completedSegmentTTL || 7 * 24 * 60 * 60 * 1000;
 	}
 
@@ -157,6 +162,50 @@ export class RedisSegmentClaimManager {
 	}
 
 	/**
+     * Get a subscriber from the pool or create a new one
+     */
+	private async getSubscriber (): Promise<RedisClientType> {
+		// Try to get from pool first
+		const subscriber = this.subscriberPool.pop();
+
+		if (subscriber && subscriber.isOpen) {
+			return subscriber;
+		}
+
+		// Create new subscriber if pool is empty or subscriber was closed
+		const newSubscriber = this.redis.duplicate();
+		await newSubscriber.connect();
+		return newSubscriber;
+	}
+
+	/**
+     * Release a subscriber back to the pool or disconnect it
+     */
+	private async releaseSubscriber (subscriber: RedisClientType): Promise<void> {
+		if (this.disposed || !subscriber.isOpen) {
+			// Always disconnect if disposed or subscriber is not open
+			try {
+				await subscriber.disconnect();
+			} catch {
+				// Ignore disconnect errors
+			}
+			return;
+		}
+
+		if (this.subscriberPool.length < this.poolSize) {
+			// Return to pool if there's space
+			this.subscriberPool.push(subscriber);
+		} else {
+			// Disconnect if pool is full
+			try {
+				await subscriber.disconnect();
+			} catch {
+				// Ignore disconnect errors
+			}
+		}
+	}
+
+	/**
      * Subscribe to segment completion events
      */
 	async subscribeToSegmentComplete (
@@ -170,21 +219,16 @@ export class RedisSegmentClaimManager {
 		const segmentKey = this.getSegmentKey(fileId, streamType, quality, streamIndex, segmentIndex);
 		const channel = `transcoder:segment:complete:${segmentKey}`;
 
-		const subscriber = this.redis.duplicate();
+		const subscriber = await this.getSubscriber();
 
 		try {
-			await subscriber.connect();
-
 			await subscriber.subscribe(channel, (message) => {
 				if (message === 'completed') {
 					callback();
 				}
 			});
 		} catch (error) {
-			// Ensure we disconnect on any failure to prevent leaks
-			if (subscriber.isOpen) {
-				await subscriber.disconnect();
-			}
+			await this.releaseSubscriber(subscriber);
 			throw error;
 		}
 
@@ -193,16 +237,37 @@ export class RedisSegmentClaimManager {
 			try {
 				if (subscriber.isOpen) {
 					await subscriber.unsubscribe(channel);
-					await subscriber.disconnect();
 				}
 			} catch (err) {
-				console.error('Error during Redis subscriber cleanup:', err);
-				// Still try to disconnect even if unsubscribe failed
-				if (subscriber.isOpen) {
-					await subscriber.disconnect().catch(() => {});
-				}
+				console.error('Error during Redis unsubscribe:', err);
+			} finally {
+				// Always release the subscriber
+				await this.releaseSubscriber(subscriber);
 			}
 		};
+	}
+
+	/**
+     * Dispose of the manager and clean up resources
+     */
+	async dispose (): Promise<void> {
+		this.disposed = true;
+
+		// Disconnect all pooled subscribers
+		const subscribers = [...this.subscriberPool];
+		this.subscriberPool.length = 0;
+
+		await Promise.all(
+			subscribers.map(async (subscriber) => {
+				try {
+					if (subscriber.isOpen) {
+						await subscriber.disconnect();
+					}
+				} catch {
+					// Ignore disconnect errors
+				}
+			}),
+		);
 	}
 
 	private getSegmentKey (

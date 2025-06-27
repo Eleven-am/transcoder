@@ -48,6 +48,10 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
 
 	private isRunning: boolean = false;
 
+	private processTimeout: NodeJS.Timeout | null = null;
+
+	private readonly processTimeoutMs = 300000; // 5 minutes
+
 	constructor (inputPath: string) {
 		super();
 		this.inputPath = inputPath;
@@ -108,6 +112,14 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
 
 		let stderrBuffer = '';
 
+		// Set up timeout
+		this.processTimeout = setTimeout(() => {
+			if (this.isRunning) {
+				this.kill('SIGTERM');
+				this.emit('error', new Error('FFmpeg process timed out'));
+			}
+		}, this.processTimeoutMs);
+
 		this.emit('start', {
 			command: `ffmpeg ${args.join(' ')}`,
 		});
@@ -131,7 +143,7 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
 		});
 
 		this.process.on('close', (code: number | null) => {
-			this.isRunning = false;
+			this.cleanup();
 
 			if (code === 0 || code === null) {
 				this.emit('end', undefined);
@@ -143,8 +155,13 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
 		});
 
 		this.process.on('error', (err) => {
-			this.isRunning = false;
+			this.cleanup();
 			this.emit('error', err);
+		});
+
+		// Clean up on process exit
+		this.process.on('exit', () => {
+			this.cleanup();
 		});
 	}
 
@@ -155,6 +172,27 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
 	kill (signal: NodeJS.Signals = 'SIGKILL'): void {
 		if (this.process && this.isRunning) {
 			this.process.kill(signal);
+			this.cleanup();
+		}
+	}
+
+	/**
+     * Cleanup resources
+     */
+	private cleanup (): void {
+		this.isRunning = false;
+
+		if (this.processTimeout) {
+			clearTimeout(this.processTimeout);
+			this.processTimeout = null;
+		}
+
+		// Remove all listeners to prevent memory leaks
+		if (this.process) {
+			this.process.removeAllListeners();
+			this.process.stderr.removeAllListeners();
+			this.process.stdout.removeAllListeners();
+			this.process = null;
 		}
 	}
 
@@ -180,6 +218,14 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
 			command: `ffmpeg ${args.join(' ')}`,
 		});
 
+		// Set up timeout for pipe mode
+		this.processTimeout = setTimeout(() => {
+			if (this.isRunning) {
+				this.kill('SIGTERM');
+				this.emit('error', new Error('FFmpeg process timed out'));
+			}
+		}, this.processTimeoutMs);
+
 		this.process.stderr.on('data', (data: Buffer) => {
 			const output = data.toString();
 
@@ -194,12 +240,12 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
 		});
 
 		this.process.on('error', (err) => {
-			this.isRunning = false;
+			this.cleanup();
 			this.emit('error', err);
 		});
 
 		this.process.on('close', (code: number | null) => {
-			this.isRunning = false;
+			this.cleanup();
 
 			if (code === 0 || code === null) {
 				this.emit('end', undefined);
@@ -208,6 +254,11 @@ export class FfmpegCommand extends ExtendedEventEmitter<FfmpegEventMap> {
 
 				this.emit('error', error);
 			}
+		});
+
+		// Clean up on process exit
+		this.process.on('exit', () => {
+			this.cleanup();
 		});
 
 		return this.process.stdout;

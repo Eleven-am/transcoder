@@ -50,6 +50,9 @@ export class JobProcessor extends ExtendedEventEmitter<JobProcessorEvents> {
 
 	private disposed: boolean = false;
 
+	private lastCpuInfo = os.cpus();
+	private lastMeasureTime = Date.now();
+
 	constructor (
         private maxConcurrentJobs: number = Math.max(1, os.cpus().length - 1),
         private readonly maxQueueSize: number = 1000,
@@ -173,7 +176,7 @@ export class JobProcessor extends ExtendedEventEmitter<JobProcessorEvents> {
 		// Define cleanup function first
 		let onEnd: () => void;
 		let onError: (error: Error) => void;
-		
+
 		const cleanup = () => {
 			job.process.removeListener('end', onEnd);
 			job.process.removeListener('error', onError);
@@ -217,25 +220,35 @@ export class JobProcessor extends ExtendedEventEmitter<JobProcessorEvents> {
 	}
 
 	/**
-     * Get system load for dynamic concurrency adjustment
+     * Get a system load for dynamic concurrency adjustment
      * @returns System load percentage (0-100)
      */
 	private getSystemLoad (): number {
-		const cpus = os.cpus();
-		let totalIdle = 0;
-		let totalTick = 0;
+		const currentCpus = os.cpus();
+		const currentTime = Date.now();
 
-		cpus.forEach((cpu) => {
-			for (const type in cpu.times) {
-				totalTick += cpu.times[type as keyof typeof cpu.times];
-			}
-			totalIdle += cpu.times.idle;
-		});
+		if (currentTime - this.lastMeasureTime < 100) {
+			return 0;
+		}
 
-		const idle = totalIdle / cpus.length;
-		const total = totalTick / cpus.length;
-		const usage = 100 - ~~(100 * idle / total);
+		let totalDiff = 0;
+		let idleDiff = 0;
 
+		for (let i = 0; i < currentCpus.length; i++) {
+			const lastCpu = this.lastCpuInfo[i];
+			const currentCpu = currentCpus[i];
+
+			const lastTotal = Object.values(lastCpu.times).reduce((a, b) => a + b, 0);
+			const currentTotal = Object.values(currentCpu.times).reduce((a, b) => a + b, 0);
+
+			totalDiff += currentTotal - lastTotal;
+			idleDiff += currentCpu.times.idle - lastCpu.times.idle;
+		}
+
+		this.lastCpuInfo = currentCpus;
+		this.lastMeasureTime = currentTime;
+
+		const usage = totalDiff > 0 ? (1 - idleDiff / totalDiff) * 100 : 0;
 		return Math.min(100, Math.max(0, usage));
 	}
 

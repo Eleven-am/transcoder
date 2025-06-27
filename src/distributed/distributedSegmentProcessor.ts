@@ -230,6 +230,9 @@ export class DistributedSegmentProcessor implements ISegmentProcessor {
 		}
 		this.activeRenewals.clear();
 
+		// Dispose claim manager to clean up Redis connections
+		await this.claimManager.dispose();
+
 		// Dispose local processor
 		await this.localProcessor.dispose();
 	}

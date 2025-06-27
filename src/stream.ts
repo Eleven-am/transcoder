@@ -96,7 +96,6 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 		maxRetries: 3,
 	};
 
-
 	private readonly videoQuality: VideoQuality | null;
 
 	private readonly audioQuality: AudioQuality | null;
@@ -346,6 +345,9 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	 */
 	buildTranscodeCommand (segmentIndex: number, priority: number): TaskEither<void> {
 		this.debounceDispose();
+
+		// Prefetch upcoming segments when processing current segment
+		this.prefetchSegments(segmentIndex, priority);
 
 		return TaskEither
 			.fromBind({
@@ -809,6 +811,38 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 	}
 
 	/**
+	 * Prefetch upcoming segments to improve performance
+	 * @param currentIndex - The current segment index being processed
+	 * @param priority - The priority of the current segment
+	 */
+	private prefetchSegments (currentIndex: number, priority: number): void {
+		const prefetchCount = 3;
+
+		for (let i = 1; i <= prefetchCount; i++) {
+			const nextIndex = currentIndex + i;
+			const nextSegment = this.segments.get(nextIndex);
+
+			if (nextSegment && !nextSegment.value) {
+				const isProcessing = this.jobRange.some(
+					range => range.start <= nextIndex &&
+					range.end >= nextIndex &&
+					range.status === JobRangeStatus.PROCESSING,
+				);
+
+				if (!isProcessing) {
+					setTimeout(() => {
+						const nextSeg = this.segments.get(nextIndex);
+						if (nextSeg && !nextSeg.value) {
+							const prefetchPriority = priority / (i + 1); // Lower priority for further segments
+							this.buildTranscodeCommand(nextIndex, prefetchPriority).toResult();
+						}
+					}, 100 * i);
+				}
+			}
+		}
+	}
+
+	/**
      * Check the status of the segments
      */
 	private checkSegmentsStatus (): TaskEither<void> {
@@ -850,18 +884,17 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 		const dynamicBatchSize = this.getDynamicBatchSize();
 		const endIndex = Math.min(startIndex + dynamicBatchSize, allSegments.length);
 
+		// Collect consecutive segments that need processing
 		for (let i = startIndex; i < endIndex; i++) {
 			const segment = allSegments[i];
 			const state = segment.value?.state();
 
-			if (state === 'pending') {
+			// Stop if we hit a segment that's already processing or completed
+			if (state === 'pending' || state === 'fulfilled') {
 				break;
 			}
 
-			if (state === 'fulfilled') {
-				break;
-			}
-
+			// Add segment if it needs processing
 			if (!segment.value || state === 'rejected') {
 				if (state === 'rejected') {
                     segment.value!.reset();
@@ -872,7 +905,28 @@ export class Stream extends ExtendedEventEmitter<StreamEventMap> {
 			}
 		}
 
-		return segmentsToProcess;
+		// Try to batch segments for more efficient processing
+		return this.optimizeBatchForProcessing(segmentsToProcess);
+	}
+
+	/**
+	 * Optimize batch of segments for efficient FFmpeg processing
+	 * Groups consecutive segments to minimize FFmpeg invocations
+	 */
+	private optimizeBatchForProcessing (segments: Segment[]): Segment[] {
+		if (segments.length <= 1) {
+			return segments;
+		}
+
+		// For hardware acceleration, larger batches are more efficient
+		if (this.isUsingHardwareAcceleration()) {
+			// Process up to 10 segments in one FFmpeg call with hardware acceleration
+			return segments.slice(0, Math.min(10, segments.length));
+		}
+
+		// For software encoding, balance between batch size and responsiveness
+		// Process up to 5 segments in one FFmpeg call
+		return segments.slice(0, Math.min(5, segments.length));
 	}
 
 	/**
